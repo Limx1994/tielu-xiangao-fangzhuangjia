@@ -1,0 +1,10 @@
+Flask==3.1.2
+waitress==3.0.2
+pyserial==3.5
+onvif-zeep==0.2.12
+pystray==0.19.5
+Pillow==12.1.0
+requests==2.32.5
+requests-toolbelt==1.0.0
+PyInstaller==6.20.0
+pytest==9.0.2

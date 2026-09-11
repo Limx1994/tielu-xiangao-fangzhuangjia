@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>事件录像系统</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <div><h1>事件录像系统</h1><p id="summary">正在连接本机服务…</p></div>
+    <div class="actions"><button id="refresh" class="ghost">刷新</button></div>
+  </header>
+  <main>
+    <section>
+      <div class="section-title"><h2>实时预览</h2><span id="camera-count" class="badge">0 路</span></div>
+      <div id="previews" class="preview-area"><div class="empty">尚未添加摄像头</div></div>
+    </section>
+
+    <section>
+      <div class="camera-setup-title">
+        <div><h2>添加摄像头</h2><p class="muted">填写摄像头的登录账号和密码，然后搜索局域网内的设备。</p></div>
+      </div>
+      <div class="camera-methods">
+      <div class="camera-method recommended">
+        <div class="method-label">推荐</div>
+        <h2>搜索并添加摄像头</h2>
+        <p class="muted method-help">搜索完成后，从设备列表中点击“添加”即可。</p>
+        <div class="form-grid">
+          <label>摄像头所在网段<input id="subnet" value="192.168.1.0/24"></label>
+          <label>ONVIF 端口<input id="onvif-port" type="number" value="80"></label>
+          <label>摄像头账号<input id="onvif-user" autocomplete="username"></label>
+          <label>摄像头密码<input id="onvif-pass" type="password" autocomplete="current-password"></label>
+        </div>
+        <div class="actions"><button id="scan-start">搜索摄像头</button><button id="scan-cancel" class="ghost">取消搜索</button></div>
+        <p id="scan-progress" class="muted">未开始</p>
+        <div id="scan-results" class="list"></div>
+      </div>
+      <details class="advanced-add">
+        <summary>没有搜索到设备？展开高级添加</summary>
+        <div class="advanced-content">
+        <p class="muted method-help">此功能需要摄像头厂家提供完整的主码流 RTSP 地址，普通用户无需填写。</p>
+        <div class="form-grid one">
+          <label>摄像头名称（可选）<input id="camera-name" placeholder="例如：一号门"></label>
+          <label>主码流 RTSP 地址<input id="camera-main" type="password" placeholder="例如：rtsp://账号:密码@192.168.1.10/stream"></label>
+        </div>
+        <div class="actions"><button id="camera-add">使用此地址添加</button></div>
+        <p class="muted">系统自动生成设备 ID，并使用该主码流录像和预览。地址及凭证保存到 config.json，页面不会回显密码。</p>
+        </div>
+      </details>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-title"><h2>系统状态</h2><span id="disk" class="badge">磁盘 --</span></div>
+      <h3>串口触发设备</h3>
+      <div id="serials" class="status-grid"><div class="empty">尚未配置串口设备</div></div>
+      <h3>摄像头录像</h3>
+      <div id="recorders" class="status-grid"></div>
+      <div id="errors" class="errors"></div>
+    </section>
+
+    <section>
+      <div class="section-title"><h2>事件与上传</h2><span class="muted">最多显示最近 200 条</span></div>
+      <div class="table-wrap"><table><thead><tr><th>时间 / 事件</th><th>摄像头</th><th>录像</th><th>OCR</th><th>车牌</th><th>文本</th><th>视频</th><th></th></tr></thead><tbody id="events"></tbody></table></div>
+    </section>
+
+    <section class="two-column">
+      <div class="panel">
+        <h2>服务器敏感配置</h2>
+        <div class="form-grid one">
+          <label>车牌上报 URL<input id="text-url" type="password" placeholder="留空保持现值"></label>
+          <label>视频上传 URL<input id="video-url" type="password" placeholder="留空保持现值"></label>
+          <label>Bearer Token<input id="api-token" type="password" placeholder="留空保持现值"></label>
+        </div>
+        <p id="secret-state" class="muted"></p>
+      </div>
+      <div class="panel config-panel">
+        <h2>完整配置</h2>
+        <textarea id="config" spellcheck="false"></textarea>
+        <div class="actions"><button id="save-config">验证、保存并应用</button><button id="autostart" class="ghost">切换开机自启</button></div>
+      </div>
+    </section>
+  </main>
+  <div id="toast" role="status"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

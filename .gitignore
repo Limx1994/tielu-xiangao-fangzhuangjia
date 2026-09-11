@@ -1,0 +1,12 @@
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+runtime/
+config.json
+*.log
+tools/ffmpeg/
+tools/ocr/*
+!tools/ocr/README.md
