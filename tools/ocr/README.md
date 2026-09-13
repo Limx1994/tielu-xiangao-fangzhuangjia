@@ -1,6 +1,6 @@
 # 本项目的 PaddleOCR 运行时
 
-本目录保存 `XgfzjRecorder` 使用的 Windows PaddleOCR 二进制、模型、运行库和来源校验信息。它是由 `scripts\fetch_dependencies.ps1` 获取的第三方运行时，不是本项目的独立源码模块。
+本目录保存 `XgfzjRecorder` 使用的 Windows PaddleOCR 二进制、模型、运行库和来源校验信息。它由 `scripts\fetch_dependencies.ps1` 按固定上游 commit 生成，不是本项目的独立源码模块，也不应手工拼装或局部升级。
 
 ## 项目集成方式
 
@@ -23,7 +23,6 @@
 ```text
 tools\ocr\
 ├── ppocr_worker.exe              # 应用实际调用的常驻 OCR worker
-├── ppocr_service.exe             # 上游附带的 TCP service，本项目不调用
 ├── models\                       # 文本检测、识别、方向分类和车牌模型
 ├── configs\OCR.yaml             # worker 配置
 ├── *.dll                         # Paddle、OpenCV、ONNX Runtime、MinGW 运行库
@@ -54,12 +53,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fetch_dependencies.p
 脚本会：
 
 - 获取指定 OCR 上游 commit，而不是不受控地使用最新版本。
-- 下载 Git LFS 文件并拒绝残留的指针文件。
+- 下载项目所需的 Git LFS 文件并拒绝残留的指针文件；不下载未使用的 TCP service。
 - 复制本项目的 `ocr\OCR.yaml`。
 - 校验并修补 worker 默认配置路径。
 - 生成 `UPSTREAM_COMMIT.txt`、`WORKER_PATCH.json` 和 `SHA256SUMS.json`。
 
 当前固定 commit 以 `UPSTREAM_COMMIT.txt` 为准。不要直接替换单个 EXE、DLL 或模型，否则容易造成 ABI、运行库或参数协议不匹配。
+
+依赖更新成功的判定条件是：必要文件均不是 Git LFS 指针、worker 默认配置路径已经校正、校验清单已重新生成，并且项目 release 构建和 OCR 启动检查通过。
 
 ## 手工诊断
 
@@ -89,9 +90,10 @@ runtime\logs\ocr.log.1
 
 ## 已知边界
 
-- 本项目不调用 `ppocr_service.exe`，不要将 service 参数套用于 worker。
+- 本项目不下载或打包 `ppocr_service.exe`，不要将 service 参数套用于 worker。
 - 当前固定版本不接受上游旧说明中的 `--fast_detect` 参数。
 - OCR 输出还会经过应用的车牌格式和置信度过滤；worker 有文字输出不代表最终一定生成车牌结果。
+- 应用启动 OCR 子进程时会移除代理环境变量；透明代理软件仍需将应用、Python 和 OCR 进程设置为直连。
 - 运行时体积较大，Git 只保存项目文档和获取脚本，二进制及模型由依赖脚本恢复。
 
 ## 来源与许可证

@@ -49,7 +49,7 @@ if ($UseGit) { try {
         git -C $checkout sparse-checkout set dist/ppocr
         git -C $checkout checkout $OcrCommit
         if ($LASTEXITCODE -eq 0) {
-            git -C $checkout lfs pull --include="dist/ppocr/**"
+            git -C $checkout lfs pull --include="dist/ppocr/**" --exclude="dist/ppocr/ppocr_service.exe"
             $gitReady = $LASTEXITCODE -eq 0
             if ($gitReady) { Copy-Item -Path (Join-Path $checkout "dist\ppocr\*") -Destination $ocrTarget -Recurse -Force }
         }
@@ -67,7 +67,7 @@ if (-not $gitReady) {
     $files = (Get-GithubJson $treeUri).tree | Where-Object {
         $_.type -eq "blob" -and $_.path.StartsWith("dist/ppocr/") -and
         $_.path -notmatch '/(test_images|output)/' -and
-        $_.path -notmatch '(^|/)(ppocr\.exe|ppocr_client\.exe|stress_test\.py|test\.jpg|stdout\.txt|stderr\.txt)$'
+        $_.path -notmatch '(^|/)(ppocr\.exe|ppocr_client\.exe|ppocr_service\.exe|stress_test\.py|test\.jpg|stdout\.txt|stderr\.txt)$'
     }
     foreach ($item in $files) {
         $relative = $item.path.Substring("dist/ppocr/".Length)
@@ -88,11 +88,12 @@ if (-not $gitReady) {
         Save-GithubFile $mediaUri $destination
     }
 }
-$required = @("ppocr_service.exe", "ppocr_worker.exe", "models\plate_rtdetr.onnx")
+$required = @("ppocr_worker.exe", "models\plate_rtdetr.onnx")
 foreach ($file in $required) {
     $path = Join-Path $ocrTarget $file
     if (-not (Test-Path $path) -or (Get-Item $path).Length -lt 100000) { throw "OCR 文件缺失或为 LFS 指针: $file" }
 }
+Remove-Item -LiteralPath (Join-Path $ocrTarget "ppocr_service.exe") -Force -ErrorAction SilentlyContinue
 $configDir = Join-Path $ocrTarget "configs"
 New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 Copy-Item -LiteralPath (Join-Path $projectRoot "ocr\OCR.yaml") -Destination (Join-Path $configDir "OCR.yaml") -Force

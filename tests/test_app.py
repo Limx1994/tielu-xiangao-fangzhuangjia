@@ -25,6 +25,13 @@ def test_health_and_security(client):
     assert client.get("/api/health", headers={"Host": "example.com"}).status_code == 403
 
 
+def test_page_exposes_forward_and_event_settings(client):
+    page = client.get("/", headers={"Host": "127.0.0.1"}).get_data(as_text=True)
+    assert 'id="forward-settings"' in page
+    assert "事件上报地址（URL 或 IP）" in page
+    assert "车牌上报地址" not in page
+
+
 def test_config_validation_rejects_bad_values():
     value = recorder.deep_merge(recorder.DEFAULT_CONFIG, {"recording": {"segment_seconds": 1}})
     with pytest.raises(recorder.AppError) as error:
@@ -35,6 +42,10 @@ def test_config_validation_rejects_bad_values():
     assert error.value.code == "INVALID_CONFIG"
     camera = {"id": "cam", "rtsp_url": "rtsp://192.0.2.1/main"}
     value = recorder.deep_merge(recorder.DEFAULT_CONFIG, {"cameras": [{**camera, "id": f"cam{i}"} for i in range(3)]})
+    with pytest.raises(recorder.AppError): recorder.validate_config(value)
+    value = recorder.deep_merge(recorder.DEFAULT_CONFIG, {"upload": {"delete_after_success": "false"}})
+    with pytest.raises(recorder.AppError): recorder.validate_config(value)
+    value = recorder.deep_merge(recorder.DEFAULT_CONFIG, {"upload": {"text_url": "ftp://192.0.2.1/report"}})
     with pytest.raises(recorder.AppError): recorder.validate_config(value)
 
 
@@ -132,12 +143,27 @@ def test_atomic_json(tmp_path):
 
 def test_manifest_iteration_is_limited(tmp_path, monkeypatch):
     monkeypatch.setattr(recorder, "EVENT_DIR", tmp_path)
-    store = recorder.ManifestStore()
+    store = recorder.ManifestStore(recorder.EVENT_DIR, recorder.atomic_json, recorder.logger, recorder.utc_now)
     for index in range(3):
         path = tmp_path / str(index) / "cam" / "manifest.json"
         recorder.atomic_json(path, {"event_id": str(index), "camera_id": "cam"})
         os.utime(path, (index + 1, index + 1))
     assert [item["event_id"] for item in store.iter_all(2)] == ["2", "1"]
+    monkeypatch.setattr(store, "load", lambda _path: pytest.fail("索引后不应重复读取 manifest"))
+    assert [item["event_id"] for item in store.iter_all(2)] == ["2", "1"]
+
+
+def test_closed_segment_probe_is_cached(tmp_path, monkeypatch):
+    segment = tmp_path / "segment.ts"; segment.write_bytes(b"one")
+    calls = []
+    monkeypatch.setattr(recorder, "probe_segment", lambda path: calls.append(path) or (10.0, ("h264",)))
+    item = recorder.Recorder.__new__(recorder.Recorder)
+    item.directory, item.process, item.segment_cache = tmp_path, None, {}
+    assert item.closed_segments() and item.segment_info(segment)[1] == ("h264",)
+    assert item.closed_segments() and calls == [segment]
+    segment.write_bytes(b"changed")
+    item.segment_info(segment)
+    assert calls == [segment, segment]
 
 
 def test_camera_credentials_use_config():
@@ -156,6 +182,23 @@ def test_config_file_secrets_are_masked_and_preserved(tmp_path):
     store.save(public)
     saved = json.loads(store.path.read_text(encoding="utf-8"))
     assert saved["upload"]["token"] == "secret" and saved["cameras"][0]["rtsp_url"] == "rtsp://user:pass@127.0.0.1/live"
+    store.save(public, clear_secrets=["token"])
+    assert json.loads(store.path.read_text(encoding="utf-8"))["upload"]["token"] == ""
+
+
+def test_http_change_is_reported_as_restart_required():
+    old = recorder.deep_merge(recorder.DEFAULT_CONFIG, {})
+    saved = recorder.deep_merge(old, {"http": {"port": 5001}})
+    class Store:
+        def save(self, *_args): return saved
+        def public(self): return recorder.deep_merge(saved, {})
+    runtime = recorder.Runtime.__new__(recorder.Runtime)
+    runtime.config_store, runtime.config, runtime.bound_http = Store(), old, old["http"]
+    runtime.config_lock = threading.RLock(); runtime.recorders = {}; runtime.previews = {}
+    runtime.ocr_client = type("OCR", (), {"config": old, "close": lambda self: None})()
+    runtime._start_recorders = lambda: None; runtime._start_serials = lambda: None
+    result = runtime.apply_config(saved)
+    assert result["restart_required"] is True and runtime.bound_http["port"] == 5000
 
 
 def test_receipt_contract():
@@ -200,6 +243,67 @@ def test_upload_body_enforces_total_timeout():
     with pytest.raises(recorder.requests.Timeout): body.read(1)
 
 
+def test_upload_addresses_accept_url_or_bare_host():
+    assert recorder.normalize_http_endpoint("192.168.1.20") == "http://192.168.1.20"
+    assert recorder.normalize_http_endpoint("192.168.1.20:8080/report") == "http://192.168.1.20:8080/report"
+    assert recorder.normalize_http_endpoint("https://example.com/upload") == "https://example.com/upload"
+    with pytest.raises(ValueError): recorder.normalize_http_endpoint("192.168.1.999/report")
+
+
+def test_forward_target_accepts_udp_url_or_ip():
+    assert recorder.normalize_udp_target("192.168.2.20") == "udp://192.168.2.20:5000"
+    assert recorder.normalize_udp_target("192.168.2.20:5001") == "udp://192.168.2.20:5001"
+    assert recorder.normalize_udp_target("udp://receiver.local:6000") == "udp://receiver.local:6000"
+    with pytest.raises(ValueError): recorder.normalize_udp_target("http://192.168.2.20:5000")
+    with pytest.raises(ValueError): recorder.normalize_udp_target("192.168.2.999:5000")
+
+
+def test_forward_targets_must_be_unique():
+    cameras = [
+        {"id": "cam1", "rtsp_url": "rtsp://192.0.2.1/main", "forward_url": "192.168.2.20:5000"},
+        {"id": "cam2", "rtsp_url": "rtsp://192.0.2.2/main", "forward_url": "udp://192.168.2.20:5000"},
+    ]
+    value = recorder.deep_merge(recorder.DEFAULT_CONFIG, {"cameras": cameras})
+    with pytest.raises(recorder.AppError, match="实时转发目标不能重复"):
+        recorder.validate_config(value)
+
+
+def test_forwarder_uses_stream_copy_and_mpegts():
+    camera = {"id": "cam", "rtsp_url": "rtsp://user:pass@192.0.2.1/main", "forward_url": "udp://192.168.2.20:5000"}
+    command = recorder.StreamForwarder(camera, recorder.FFMPEG, threading.Event(), {})._command()
+    assert command[command.index("-c:v") + 1] == "copy"
+    assert command[command.index("-f") + 1] == "mpegts"
+    assert command[-1] == "udp://192.168.2.20:5000?pkt_size=1316"
+
+
+def test_config_store_normalizes_bare_upload_addresses(tmp_path):
+    store = recorder.ConfigStore.__new__(recorder.ConfigStore)
+    store.path, store.lock = tmp_path / "config.json", threading.RLock()
+    store.data = recorder.deep_merge(recorder.DEFAULT_CONFIG, {})
+    saved = store.save(recorder.DEFAULT_CONFIG, {"text_url": "192.168.1.20/report", "video_url": "192.168.1.21:8080/video"})
+    assert saved["upload"]["text_url"] == "http://192.168.1.20/report"
+    assert saved["upload"]["video_url"] == "http://192.168.1.21:8080/video"
+
+
+def test_config_store_normalizes_forward_target(tmp_path):
+    store = recorder.ConfigStore.__new__(recorder.ConfigStore)
+    store.path, store.lock = tmp_path / "config.json", threading.RLock()
+    store.data = recorder.deep_merge(recorder.DEFAULT_CONFIG, {})
+    incoming = recorder.deep_merge(recorder.DEFAULT_CONFIG, {"cameras": [{"id": "cam1", "rtsp_url": "rtsp://192.0.2.1/main", "forward_url": "192.168.2.20:5001"}]})
+    saved = store.save(incoming)
+    assert saved["cameras"][0]["forward_url"] == "udp://192.168.2.20:5001"
+
+
+def test_network_clients_ignore_proxy_environment(monkeypatch):
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+        monkeypatch.setenv(name, "http://127.0.0.1:1")
+    environment = recorder.process_args([])["env"]
+    assert not any(key.upper().endswith("_PROXY") and key.upper() != "NO_PROXY" for key in environment)
+    assert environment["NO_PROXY"] == environment["no_proxy"] == "*"
+    with recorder.direct_session() as session:
+        assert session.trust_env is False and session.proxies == {}
+
+
 def test_scan_credentials_are_encoded_and_scrubbed():
     value = recorder.authenticated_url("rtsp://192.0.2.1/live", "admin user", "p@ss")
     assert value == "rtsp://admin%20user:p%40ss@192.0.2.1/live"
@@ -227,10 +331,11 @@ def test_scan_result_stores_credentials_in_config():
     ]}]}
     runtime.config_store = type("Store", (), {"get": lambda self: {"cameras": []}})()
     runtime.apply_config = lambda config: saved.update(config)
-    camera = runtime.add_camera({"id": "gate_1", "scan_ip": "192.0.2.1"})
+    camera = runtime.add_camera({"id": "gate_1", "scan_ip": "192.0.2.1", "forward_url": "192.168.2.20:5000"})
     assert "secret" not in json.dumps(camera)
     assert saved["cameras"][0]["rtsp_url"] == "rtsp://admin:secret@192.0.2.1/main"
     assert saved["cameras"][0]["preview_url"] == saved["cameras"][0]["rtsp_url"]
+    assert saved["cameras"][0]["forward_url"] == "udp://192.168.2.20:5000"
 
 
 def test_manual_camera_generates_id_and_main_preview():
@@ -238,8 +343,59 @@ def test_manual_camera_generates_id_and_main_preview():
     runtime = recorder.Runtime.__new__(recorder.Runtime)
     runtime.config_store = type("Store", (), {"get": lambda self: {"cameras": []}})()
     runtime.apply_config = lambda config: saved.update(config)
-    camera = runtime.add_camera({"name": "一号门", "rtsp_url": "rtsp://192.0.2.8/main"})
+    camera = runtime.add_camera({"name": "一号门", "rtsp_url": "rtsp://192.0.2.8/main", "forward_url": "udp://192.168.2.20:5000"})
     assert camera["id"] == "cam_192_0_2_8" and saved["cameras"][0]["preview_url"] == "rtsp://192.0.2.8/main"
+    assert saved["cameras"][0]["forward_url"] == "udp://192.168.2.20:5000"
+
+
+def test_manual_camera_rejects_invalid_forward_target():
+    runtime = recorder.Runtime.__new__(recorder.Runtime)
+    runtime.config_store = type("Store", (), {"get": lambda self: {"cameras": []}})()
+    with pytest.raises(recorder.AppError) as error:
+        runtime.add_camera({"rtsp_url": "rtsp://192.0.2.8/main", "forward_url": "http://192.168.2.20:5000"})
+    assert error.value.status == 422 and error.value.code == "INVALID_CAMERA"
+
+
+def test_manual_camera_ids_distinguish_streams():
+    state = {"cameras": []}
+    runtime = recorder.Runtime.__new__(recorder.Runtime)
+    runtime.config_store = type("Store", (), {"get": lambda self: {"cameras": list(state["cameras"])}})()
+    runtime.apply_config = lambda config: state.update(config) or config
+    first = runtime.add_camera({"rtsp_url": "rtsp://192.0.2.8/channel1"})
+    second = runtime.add_camera({"rtsp_url": "rtsp://192.0.2.8/channel2"})
+    assert first["id"] != second["id"] and len(state["cameras"]) == 2
+
+
+def test_remove_camera_updates_config():
+    saved = {}
+    cameras = [{"id": "cam1"}, {"id": "cam2"}]
+    runtime = recorder.Runtime.__new__(recorder.Runtime)
+    runtime.config_lock = threading.RLock()
+    runtime.config_store = type("Store", (), {"get": lambda self: {"cameras": cameras}})()
+    runtime.manifests = type("Manifests", (), {"iter_all": lambda self: iter(())})()
+    runtime.apply_config = lambda config: saved.update(config) or config
+    result = runtime.remove_camera("cam1")
+    assert result["cameras"] == [{"id": "cam2"}]
+    with pytest.raises(recorder.AppError) as error: runtime.remove_camera("missing")
+    assert error.value.code == "NOT_FOUND"
+
+
+def test_remove_camera_rejects_pending_event():
+    runtime = recorder.Runtime.__new__(recorder.Runtime); runtime.config_lock = threading.RLock()
+    runtime.config = recorder.deep_merge(recorder.DEFAULT_CONFIG, {"cameras": [{"id": "cam1", "rtsp_url": "rtsp://192.0.2.1/main"}]})
+    runtime.config_store = type("Store", (), {"get": lambda self: runtime.config, "save": lambda *_: pytest.fail("忙碌摄像头配置不应保存")})()
+    runtime.manifests = type("Manifests", (), {"iter_all": lambda self: iter([{"camera_id": "cam1", "recording": {"status": "waiting"}}])})()
+    updated = recorder.deep_merge(runtime.config, {"cameras": []})
+    with pytest.raises(recorder.AppError) as error: runtime.apply_config(updated)
+    assert error.value.code == "CAMERA_BUSY"
+
+
+def test_remove_camera_api(client, monkeypatch):
+    removed = []
+    monkeypatch.setattr(recorder.runtime, "remove_camera", lambda camera_id: removed.append(camera_id) or {"cameras": []})
+    response = client.delete("/api/cameras/cam_1", headers=client.csrf_headers)
+    assert response.status_code == 200 and response.get_json() == {"cameras": []}
+    assert removed == ["cam_1"]
 
 
 def test_segment_protection_is_reference_counted(tmp_path):
@@ -361,6 +517,9 @@ def test_recovery_restores_segment_reference(tmp_path):
 def test_real_http_json_and_stream_upload(tmp_path, monkeypatch):
     video = tmp_path / "event.mp4"; video.write_bytes(b"stream-data" * 200_000)
     digest, seen = recorder.sha256_file(video), {}
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
+    monkeypatch.setenv("NO_PROXY", "")
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format, *args): pass
         def do_POST(self):
@@ -400,6 +559,17 @@ def test_real_http_json_and_stream_upload(tmp_path, monkeypatch):
 def test_config_api_requires_csrf(client):
     response = client.put("/api/config", json={"config": recorder.DEFAULT_CONFIG}, headers={"Host": "127.0.0.1"})
     assert response.status_code == 403
+
+
+def test_config_api_forwards_secret_clear(client, monkeypatch):
+    seen = {}
+    def apply(config, secrets, clear):
+        seen.update(config=config, secrets=secrets, clear=clear)
+        return {"restart_required": False}
+    monkeypatch.setattr(recorder.runtime, "apply_config", apply)
+    body = {"config": recorder.DEFAULT_CONFIG, "secrets": {"token": ""}, "clear_secrets": ["token"]}
+    response = client.put("/api/config", json=body, headers=client.csrf_headers)
+    assert response.status_code == 200 and seen["clear"] == ["token"]
 
 
 def test_ocr_zero_frames_is_failure(tmp_path, monkeypatch):

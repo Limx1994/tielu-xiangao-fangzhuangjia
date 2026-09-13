@@ -11,14 +11,16 @@ dist = root / "dist" / "XgfzjRecorder"
 exe = (dist / "XgfzjRecorder.exe").resolve()
 run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
 name = "XgfzjRecorder"
+config = json.loads((dist / "config.json").read_text(encoding="utf-8-sig")) if (dist / "config.json").exists() else {"http": {"port": 5000}}
+base_url = f"http://127.0.0.1:{int(config['http']['port'])}"
 
 
 def call(method, path, token=None, payload=None):
     data = json.dumps(payload).encode() if payload is not None else None
-    headers = {"Origin": "http://127.0.0.1:5000"}
+    headers = {"Origin": base_url}
     if token: headers["X-CSRF-Token"] = token
     if data: headers["Content-Type"] = "application/json"
-    request = urllib.request.Request("http://127.0.0.1:5000" + path, data=data, headers=headers, method=method)
+    request = urllib.request.Request(base_url + path, data=data, headers=headers, method=method)
     with urllib.request.urlopen(request, timeout=5) as response:
         return json.load(response)
 
