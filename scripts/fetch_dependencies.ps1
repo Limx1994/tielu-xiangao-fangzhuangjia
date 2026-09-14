@@ -94,6 +94,7 @@ foreach ($file in $required) {
     if (-not (Test-Path $path) -or (Get-Item $path).Length -lt 100000) { throw "OCR 文件缺失或为 LFS 指针: $file" }
 }
 Remove-Item -LiteralPath (Join-Path $ocrTarget "ppocr_service.exe") -Force -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath (Join-Path $ocrTarget ".json") -Force -ErrorAction SilentlyContinue
 $configDir = Join-Path $ocrTarget "configs"
 New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 Copy-Item -LiteralPath (Join-Path $projectRoot "ocr\OCR.yaml") -Destination (Join-Path $configDir "OCR.yaml") -Force

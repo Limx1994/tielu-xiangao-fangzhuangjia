@@ -18,6 +18,8 @@
 
 正常使用时无需手工启动 OCR 进程；运行 `app.py` 或打包后的 `XgfzjRecorder.exe` 即可。
 
+事件视频拼接完成后，应用固定以 2 FPS 抽帧。扫描以触发点为中心，每次读取前后各最多 5 秒画面，并按距触发点由近到远送入 worker；首次识别到满足格式和置信度要求的车牌后停止。该帧率不是 worker 参数，也不能通过 `config.json` 调整；旧版 `ocr.fps` 字段会由应用自动移除。
+
 ## 目录内容
 
 ```text
@@ -56,6 +58,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fetch_dependencies.p
 - 下载项目所需的 Git LFS 文件并拒绝残留的指针文件；不下载未使用的 TCP service。
 - 复制本项目的 `ocr\OCR.yaml`。
 - 校验并修补 worker 默认配置路径。
+- 清理上游残留的无名 `.json` 文件。
 - 生成 `UPSTREAM_COMMIT.txt`、`WORKER_PATCH.json` 和 `SHA256SUMS.json`。
 
 当前固定 commit 以 `UPSTREAM_COMMIT.txt` 为准。不要直接替换单个 EXE、DLL 或模型，否则容易造成 ABI、运行库或参数协议不匹配。
@@ -64,7 +67,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fetch_dependencies.p
 
 ## Release 打包行为
 
-`scripts\build.ps1` 只将应用需要的 OCR 文件复制到 staging release，不包含未使用的 `ppocr_service.exe`，也不会直接复用源码目录中的 `SHA256SUMS.json`。脚本会基于实际发布内容重新生成校验清单，并逐项复算 SHA-256；校验或冒烟测试失败时不会替换已有 release。
+`scripts\build.ps1` 只将应用需要的 OCR 文件复制到 staging release，不包含未使用的 `ppocr_service.exe`、上游残留的无名 `.json` 文件，也不会直接复用源码目录中的 `SHA256SUMS.json`。脚本会基于实际发布内容重新生成校验清单，并逐项复算 SHA-256；校验或冒烟测试失败时不会替换已有 release。
 
 因此，源码依赖目录与发布目录的校验清单文件数量可能不同，这是裁剪未使用组件后的预期结果。排查发布包时应以 `dist\XgfzjRecorder\tools\ocr\SHA256SUMS.json` 为准，不应将源码清单直接覆盖到 release。
 
@@ -91,7 +94,7 @@ runtime\logs\ocr.log.1
 | worker 启动后立即退出 | `models`、`configs\OCR.yaml`、MinGW DLL 是否齐全 |
 | 报 OCR 文件缺失或 LFS 指针 | 重新运行依赖脚本，确认下载完整 |
 | 30 秒内没有 `READY` | 查看 `runtime\logs\ocr.log`，检查模型加载和内存 |
-| 识别结果为空 | 检查图片质量、车牌出现时长、OCR 置信度和抽样 FPS |
+| 识别结果为空 | 检查图片质量、车牌出现时长、OCR 置信度，以及事件视频是否覆盖触发前后画面 |
 | DLL 加载失败 | 不要混用其他 MinGW 或 PaddleOCR 发行包中的 DLL |
 
 ## 已知边界

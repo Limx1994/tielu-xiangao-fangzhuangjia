@@ -24,6 +24,7 @@ def test_health_and_security(client):
     assert client.get("/api/health", headers={"Host": "127.0.0.1"}).status_code == 200
     assert client.get("/missing", headers={"Host": "127.0.0.1"}).status_code == 404
     assert client.get("/api/health", headers={"Host": "example.com"}).status_code == 403
+    assert "fps" not in client.get("/api/config", headers={"Host": "127.0.0.1"}).get_json()["ocr"]
 
 
 def test_page_exposes_all_config_settings(client):
@@ -33,7 +34,7 @@ def test_page_exposes_all_config_settings(client):
     expected_ids = (
         "config-version", "http-host", "http-port", "recording-pre-seconds",
         "recording-post-seconds", "recording-segment-seconds", "preview-width",
-        "preview-fps", "preview-idle-seconds", "ocr-enabled", "ocr-fps",
+        "preview-fps", "preview-idle-seconds", "ocr-enabled",
         "ocr-confidence", "ocr-cpu-threads", "upload-delete-after-success",
         "upload-connect-timeout", "upload-read-timeout", "upload-total-timeout",
         "upload-max-retries", "text-url", "video-url", "api-token",
@@ -42,6 +43,7 @@ def test_page_exposes_all_config_settings(client):
     )
     for element_id in expected_ids:
         assert f'id="{element_id}"' in page
+    assert 'id="ocr-fps"' not in page and "固定以 2 FPS" in page
     for button_id in ("save-http", "save-recording", "save-preview", "save-ocr", "save-upload", "save-storage"):
         assert f'id="{button_id}"' in page
     assert 'id="config-version" readonly' in page
@@ -94,7 +96,7 @@ def test_config_validation_accepts_all_group_boundaries():
         "http": {"host": "localhost", "port": 65535},
         "recording": {"pre_seconds": 3600, "post_seconds": 600, "segment_seconds": 60},
         "preview": {"width": 1920, "fps": 15, "idle_seconds": 600},
-        "ocr": {"enabled": False, "fps": 10, "confidence": 1, "cpu_threads": 16},
+        "ocr": {"enabled": False, "confidence": 1, "cpu_threads": 16},
         "upload": {"delete_after_success": True, "connect_timeout": 300, "read_timeout": 600,
                    "total_timeout": 86400, "max_retries": 100},
         "storage": {"reserve_percent": 50, "reserve_bytes": 0, "cache_keep_seconds": 86400},
@@ -109,7 +111,6 @@ def test_config_validation_accepts_all_group_boundaries():
     {"preview": {"idle_seconds": 4}},
     {"ocr": {"enabled": "true"}},
     {"ocr": {"confidence": 1.01}},
-    {"ocr": {"fps": 0}},
     {"ocr": {"cpu_threads": 17}},
     {"upload": {"connect_timeout": 0}},
     {"upload": {"read_timeout": 601}},
@@ -219,6 +220,21 @@ def test_normalize_plate():
     assert recorder.OCRClient.plate_pattern.fullmatch("粤B12345")
     assert recorder.OCRClient.plate_pattern.fullmatch("粤BD12345")
     assert not recorder.OCRClient.plate_pattern.fullmatch("ABC123")
+
+
+def test_ocr_batches_expand_from_trigger(monkeypatch):
+    calls = []
+    def frames(_video, fps, start=0.0, duration=None):
+        calls.append((fps, start, duration))
+        return iter((start + index / fps, bytes([index])) for index in range(round(duration * fps)))
+    monkeypatch.setattr(recorder, "jpeg_frames", frames)
+    batches = list(recorder.ocr_frame_batches(recorder.Path("event.mp4"), 0.0, 12.0, 20.0))
+    timestamps = [timestamp for batch in batches for timestamp, _jpeg in batch]
+    assert [len(batch) for batch in batches] == [20, 16, 4]
+    assert timestamps[:5] == [12.0, 12.5, 11.5, 13.0, 11.0]
+    assert sorted(timestamps) == [index / 2 for index in range(40)]
+    assert len(timestamps) == len(set(timestamps)) and max(map(len, batches)) <= 20
+    assert all(fps == 2 and 0 < duration <= 5 for fps, _start, duration in calls)
 
 
 def test_ocr_worker_nested_result(monkeypatch):
@@ -373,6 +389,17 @@ def test_config_store_preserves_extensions_and_rejects_invalid_write(tmp_path):
     with pytest.raises(recorder.AppError):
         store.save(invalid)
     assert store.path.read_bytes() == before
+
+
+def test_config_store_removes_legacy_ocr_fps(tmp_path, monkeypatch):
+    legacy = recorder.deep_merge(recorder.DEFAULT_CONFIG, {"ocr": {"fps": 7}})
+    recorder.atomic_json(tmp_path / "config.json", legacy)
+    monkeypatch.setattr(recorder, "BASE_DIR", tmp_path)
+    store = recorder.ConfigStore()
+    assert "fps" not in store.get()["ocr"]
+    assert "fps" not in json.loads(store.path.read_text(encoding="utf-8"))["ocr"]
+    incoming = store.public(); incoming.pop("secret_status"); incoming["ocr"]["fps"] = 9
+    assert "fps" not in store.save(incoming)["ocr"]
 
 
 def test_http_change_is_reported_as_restart_required():
@@ -974,6 +1001,7 @@ def test_tray_autostart_shows_state_and_feedback(monkeypatch):
 
 def test_ocr_zero_frames_is_failure(tmp_path, monkeypatch):
     manifest = {"event_id": "evt", "camera_id": "cam", "video_path": str(tmp_path / "event.mp4"),
+                "trigger_time": 110.0, "coverage": {"actual_start": 100.0},
                 "recording": {"status": "complete"}, "ocr": {"status": "pending"}, "config": recorder.DEFAULT_CONFIG}
     class Store:
         def load(self, path): return manifest
@@ -982,7 +1010,8 @@ def test_ocr_zero_frames_is_failure(tmp_path, monkeypatch):
     runtime.queue_sets = {name: set() for name in ("ocr", "upload")}; runtime.queue_lock = threading.Lock()
     runtime.queues = {name: queue.Queue() for name in runtime.queue_sets}; runtime.ocr_client = object(); runtime.status_errors = []
     path = tmp_path / "manifest.json"; runtime.queues["ocr"].put(path); runtime.queue_sets["ocr"].add(str(path))
-    monkeypatch.setattr(recorder, "jpeg_frames", lambda *_: iter(()))
+    monkeypatch.setattr(recorder, "probe_duration", lambda _video: 30.0)
+    monkeypatch.setattr(recorder, "ocr_frame_batches", lambda *_args: iter(()))
     worker = threading.Thread(target=runtime._ocr_worker); worker.start()
     for _ in range(50):
         if manifest["ocr"].get("status") != "pending": break
@@ -991,11 +1020,62 @@ def test_ocr_zero_frames_is_failure(tmp_path, monkeypatch):
     assert manifest["ocr"]["status"] == "failed" and manifest["ocr"]["error"] == "未抽取到视频帧"
 
 
+@pytest.mark.parametrize(("frame_batches", "expected_status", "expected_calls", "expected_failed", "expected_plates"), [
+    ([[(100.0, b"invalid"), (100.25, b"error")], [(100.5, b"low"), (99.5, b"valid"), (101.0, b"unused")]],
+     "partial", [b"invalid", b"error", b"low", b"valid"], 1,
+     [{"text": "粤B12345", "confidence": 0.95, "timestamp": 99.5}]),
+    ([[(100.0, b"error"), (100.5, b"error2")]], "failed", [b"error", b"error2"], 2, []),
+])
+def test_ocr_stops_and_reports_failures(tmp_path, monkeypatch, frame_batches, expected_status, expected_calls, expected_failed, expected_plates):
+    config = recorder.deep_merge(recorder.DEFAULT_CONFIG, {"recording": {"pre_seconds": 120}})
+    manifest = {"event_id": "evt", "camera_id": "cam", "video_path": str(tmp_path / "event.mp4"),
+                "trigger_time": 1000.0, "coverage": {"actual_start": 900.0},
+                "recording": {"status": "complete"}, "ocr": {"status": "pending"}, "config": config,
+                "text_upload": {"status": "pending"}, "video_upload": {"status": "pending"}}
+    saved, calls, batch_args = [], [], []
+    class Store:
+        def load(self, _path): return manifest
+        def save(self, value): saved.append(value["ocr"].copy())
+    class OCR:
+        def __init__(self): self.config, self.lock = config, threading.RLock()
+        def recognize(self, jpeg, _config):
+            calls.append(jpeg)
+            if jpeg.startswith(b"error"): raise OSError("OCR failed")
+            results = {
+                b"invalid": {"rec_texts": ["ABC123"], "rec_scores": [0.99]},
+                b"low": {"rec_texts": ["粤B12345"], "rec_scores": [0.5]},
+                b"valid": {"rec_texts": ["粤B12345"], "rec_scores": [0.95]},
+            }
+            return results[jpeg]
+        def close(self): pass
+    def batch_source(_video, start, trigger, end):
+        batch_args.append((start, trigger, end))
+        return iter(frame_batches)
+    runtime = recorder.Runtime.__new__(recorder.Runtime)
+    runtime.stop, runtime.manifests, runtime.ocr_client = threading.Event(), Store(), OCR()
+    runtime.queue_sets = {name: set() for name in ("ocr", "upload")}; runtime.queue_lock = threading.Lock()
+    runtime.queues = {name: queue.Queue() for name in runtime.queue_sets}; runtime.status_errors = []
+    path = tmp_path / "manifest.json"; runtime.queues["ocr"].put(path); runtime.queue_sets["ocr"].add(str(path))
+    monkeypatch.setattr(recorder, "probe_duration", lambda _video: 140.0)
+    monkeypatch.setattr(recorder, "ocr_frame_batches", batch_source)
+    worker = threading.Thread(target=runtime._ocr_worker); worker.start()
+    for _ in range(50):
+        if manifest["ocr"].get("status") != "pending": break
+        threading.Event().wait(0.02)
+    runtime.stop.set(); worker.join(2)
+    assert batch_args == [(0.0, 100.0, 140.0)]
+    assert calls == expected_calls
+    assert manifest["ocr"] == {"status": expected_status, "plates": expected_plates, "frames": len(expected_calls),
+                               "failed_frames": expected_failed, "error": f"{expected_failed} 帧失败" if expected_failed else None}
+    assert saved and runtime.queues["upload"].get_nowait() == path
+
+
 def test_old_enabled_ocr_task_closes_worker_when_current_config_disabled(tmp_path, monkeypatch):
     old_config = recorder.deep_merge(recorder.DEFAULT_CONFIG, {"ocr": {"enabled": True}})
     current_config = recorder.deep_merge(recorder.DEFAULT_CONFIG, {"ocr": {"enabled": False}})
     manifest = {
         "event_id": "evt", "camera_id": "cam", "video_path": str(tmp_path / "event.mp4"),
+        "trigger_time": 1.0, "coverage": {"actual_start": 0.0},
         "recording": {"status": "complete"}, "ocr": {"status": "pending"}, "config": old_config,
     }
     closed, recognized = threading.Event(), []
@@ -1014,7 +1094,8 @@ def test_old_enabled_ocr_task_closes_worker_when_current_config_disabled(tmp_pat
     runtime.queue_sets = {name: set() for name in ("ocr", "upload")}; runtime.queue_lock = threading.Lock()
     runtime.queues = {name: queue.Queue() for name in runtime.queue_sets}; runtime.status_errors = []
     path = tmp_path / "manifest.json"; runtime.queues["ocr"].put(path); runtime.queue_sets["ocr"].add(str(path))
-    monkeypatch.setattr(recorder, "jpeg_frames", lambda *_args: iter([(0.0, b"jpeg")]))
+    monkeypatch.setattr(recorder, "probe_duration", lambda _video: 2.0)
+    monkeypatch.setattr(recorder, "ocr_frame_batches", lambda *_args: iter([[(1.0, b"jpeg")]]))
     worker = threading.Thread(target=runtime._ocr_worker); worker.start()
     assert closed.wait(2)
     runtime.stop.set(); worker.join(2)

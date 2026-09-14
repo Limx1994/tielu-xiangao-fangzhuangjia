@@ -56,7 +56,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "http": {"host": "127.0.0.1", "port": 5000},
     "recording": {"pre_seconds": 120, "post_seconds": 20, "segment_seconds": 10},
     "preview": {"width": 640, "fps": 5, "idle_seconds": 15},
-    "ocr": {"enabled": True, "fps": 1, "confidence": 0.8, "cpu_threads": 2},
+    "ocr": {"enabled": True, "confidence": 0.8, "cpu_threads": 2},
     "upload": {
         "delete_after_success": False,
         "connect_timeout": 5,
@@ -71,6 +71,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "cameras": [],
     "serial_ports": [{"device_id": "trigger_1", "baudrate": 9600, "mode": "text", "trigger": "XGFZJ:TRIGGER:trigger_1:1\r\n", "enabled": True}],
 }
+OCR_FPS = 2
+OCR_BATCH_SECONDS = 5.0
 SERIAL_PROBE = b"XGFZJ:DISCOVER:1\r\n"
 class AppError(Exception):
     def __init__(self, message: str, code: str = "APP_ERROR", status: int = 400):
@@ -146,7 +148,7 @@ def validate_config(config: dict[str, Any]) -> None:
         ocr = config["ocr"]
         if not isinstance(ocr["enabled"], bool): raise ValueError("OCR enabled 必须为布尔值")
         if not 0 <= float(ocr["confidence"]) <= 1: raise ValueError("OCR 置信度必须在 0-1")
-        if not 1 <= int(ocr["fps"]) <= 10 or not 1 <= int(ocr["cpu_threads"]) <= 16: raise ValueError("OCR 帧率或线程数超出范围")
+        if not 1 <= int(ocr["cpu_threads"]) <= 16: raise ValueError("OCR 线程数超出范围")
         upload = config["upload"]
         if not isinstance(upload["delete_after_success"], bool): raise ValueError("delete_after_success 必须为布尔值")
         if not 1 <= float(upload["connect_timeout"]) <= 300 or not 1 <= float(upload["read_timeout"]) <= 600 or not 10 <= float(upload["total_timeout"]) <= 86400 or not 1 <= int(upload["max_retries"]) <= 100: raise ValueError("上传超时或重试参数超出范围")
@@ -234,18 +236,21 @@ class ConfigStore:
         if self.path.exists():
             with self.path.open("r", encoding="utf-8") as stream:
                 self.data = deep_merge(self.data, json.load(stream))
-        self.data.get("ocr", {}).pop("port", None)
+        ocr = self.data.get("ocr", {})
+        migrated = "fps" in ocr
+        ocr.pop("port", None); ocr.pop("fps", None)
         for key in ("text_url", "video_url"): self.data["upload"][key] = normalize_http_endpoint(self.data["upload"].get(key))
         for camera in self.data["cameras"]: camera["forward_url"] = normalize_udp_target(camera.get("forward_url"))
         validate_config(self.data)
-        if not self.path.exists():
+        if not self.path.exists() or migrated:
             atomic_json(self.path, self.data)
     def get(self) -> dict[str, Any]:
         with self.lock:
             return copy.deepcopy(self.data)
     def save(self, incoming: dict[str, Any], secrets_update: dict[str, str] | None = None, clear_secrets: Iterable[str] | None = None) -> dict[str, Any]:
         current = self.get()
-        candidate = deep_merge(DEFAULT_CONFIG, incoming); candidate.pop("restart_required", None); candidate.get("ocr", {}).pop("port", None)
+        candidate = deep_merge(DEFAULT_CONFIG, incoming); candidate.pop("restart_required", None)
+        candidate_ocr = candidate.get("ocr", {}); candidate_ocr.pop("port", None); candidate_ocr.pop("fps", None)
         if not (clear := set(clear_secrets or ())) <= {"text_url", "video_url", "token"}: raise AppError("待清除的敏感配置无效", "INVALID_BODY", 422)
         old_cameras = {item["id"]: item for item in current["cameras"]}
         for camera in candidate["cameras"]:
@@ -473,8 +478,12 @@ def read_line_timeout(process: subprocess.Popen, timeout: float) -> str:
     except queue.Empty:
         if process.poll() is None: process.terminate()
         raise AppError("OCR worker 响应超时", "OCR_TIMEOUT", 504) from None
-def jpeg_frames(video: Path, fps: int) -> Iterable[tuple[float, bytes]]:
-    command = [str(FFMPEG), "-hide_banner", "-loglevel", "error", "-i", str(video), "-vf", f"fps={fps}", "-q:v", "4", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
+def jpeg_frames(video: Path, fps: int, start: float = 0.0, duration: float | None = None) -> Iterable[tuple[float, bytes]]:
+    command = [str(FFMPEG), "-hide_banner", "-loglevel", "error"]
+    if start > 0: command.extend(("-ss", f"{start:.6f}"))
+    command.extend(("-i", str(video)))
+    if duration is not None: command.extend(("-t", f"{duration:.6f}"))
+    command.extend(("-vf", f"fps={fps}", "-q:v", "4", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"))
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **process_args()); errors: deque[bytes] = deque(maxlen=20)
     drain = threading.Thread(target=drain_pipe, args=(process.stderr, errors, b""), daemon=True); drain.start()
     buffer, index = bytearray(), 0
@@ -487,18 +496,37 @@ def jpeg_frames(video: Path, fps: int) -> Iterable[tuple[float, bytes]]:
             if len(buffer) > 25_000_000:
                 raise AppError("OCR 抽帧缓冲异常", "FRAME_TOO_LARGE", 500)
             while True:
-                start, end = buffer.find(b"\xff\xd8"), buffer.find(b"\xff\xd9")
-                if start < 0 or end < start:
+                frame_start, frame_end = buffer.find(b"\xff\xd8"), buffer.find(b"\xff\xd9")
+                if frame_start < 0 or frame_end < frame_start:
                     break
-                yield index / fps, bytes(buffer[start:end + 2])
+                yield start + index / fps, bytes(buffer[frame_start:frame_end + 2])
                 index += 1
-                del buffer[:end + 2]
+                del buffer[:frame_end + 2]
         code = process.wait(timeout=10)
         if code:
             drain.join(1); error = b"".join(errors).decode("utf-8", "replace")[-1000:]
             raise AppError(error or "FFmpeg 抽帧失败", "FRAME_EXTRACT_FAILED", 500)
     finally:
         stop_process(process)
+def ocr_frame_batches(video: Path, window_start: float, trigger: float, window_end: float) -> Iterable[list[tuple[float, bytes]]]:
+    radius, seen = 0.0, set()
+    while trigger - radius > window_start or trigger + radius < window_end:
+        before_end, after_start = trigger - radius, trigger + radius
+        before_start = max(window_start, before_end - OCR_BATCH_SECONDS)
+        after_end = min(window_end, after_start + OCR_BATCH_SECONDS)
+        batch: list[tuple[float, bytes]] = []
+        if before_end > before_start:
+            batch.extend(jpeg_frames(video, OCR_FPS, before_start, before_end - before_start))
+        if after_end > after_start:
+            batch.extend(jpeg_frames(video, OCR_FPS, after_start, after_end - after_start))
+        batch.sort(key=lambda item: (abs(item[0] - trigger), item[0] < trigger, item[0]))
+        unique = []
+        for timestamp, jpeg in batch:
+            key = round(timestamp, 6)
+            if key not in seen:
+                seen.add(key); unique.append((timestamp, jpeg))
+        if unique: yield unique
+        radius += OCR_BATCH_SECONDS
 def normalize_plate(text: str) -> str:
     return re.sub(r"[·•.\s_-]", "", text.upper())
 class Runtime:
@@ -760,21 +788,27 @@ class Runtime:
                 plates: dict[str, dict[str, Any]] = {}
                 frames = failed = 0
                 if config["ocr"]["enabled"]:
-                    for timestamp, jpeg in jpeg_frames(Path(manifest["video_path"]), int(config["ocr"]["fps"])):
-                        if self.stop.is_set(): return
-                        frames += 1
-                        try:
-                            data = self.ocr_client.recognize(jpeg, config)
-                            texts, scores = data.get("rec_texts", []), data.get("rec_scores", [])
-                            for text, score in zip(texts, scores, strict=False):
-                                plate = normalize_plate(str(text))
-                                score = float(score)
-                                if score >= float(config["ocr"]["confidence"]) and OCRClient.plate_pattern.fullmatch(plate):
-                                    current = plates.get(plate)
-                                    if not current or score > current["confidence"]: plates[plate] = {"text": plate, "confidence": score, "timestamp": timestamp}
-                        except Exception as exc:
-                            failed += 1
-                            logger.warning("OCR 帧失败 %s %.3f: %s", manifest["event_id"], timestamp, exc)
+                    video = Path(manifest["video_path"]); duration = probe_duration(video)
+                    actual_start = float(manifest["coverage"]["actual_start"])
+                    trigger = min(max(float(manifest["trigger_time"]) - actual_start, 0.0), duration)
+                    window_start = max(0.0, trigger - float(config["recording"]["pre_seconds"]))
+                    for batch in ocr_frame_batches(video, window_start, trigger, duration):
+                        for timestamp, jpeg in batch:
+                            if self.stop.is_set(): return
+                            frames += 1
+                            try:
+                                data = self.ocr_client.recognize(jpeg, config)
+                                texts, scores = data.get("rec_texts", []), data.get("rec_scores", [])
+                                for text, score in zip(texts, scores, strict=False):
+                                    plate = normalize_plate(str(text)); score = float(score)
+                                    if score >= float(config["ocr"]["confidence"]) and OCRClient.plate_pattern.fullmatch(plate):
+                                        current = plates.get(plate)
+                                        if not current or score > current["confidence"]: plates[plate] = {"text": plate, "confidence": score, "timestamp": timestamp}
+                            except Exception as exc:
+                                failed += 1
+                                logger.warning("OCR 帧失败 %s %.3f: %s", manifest["event_id"], timestamp, exc)
+                            if plates: break
+                        if plates: break
                 status = "disabled" if not config["ocr"]["enabled"] else ("failed" if not frames or failed == frames else "partial" if failed else "complete" if plates else "no_plate")
                 error = "未抽取到视频帧" if config["ocr"]["enabled"] and not frames else (f"{failed} 帧失败" if failed else None)
                 manifest["ocr"].update(status=status, plates=list(plates.values()), frames=frames, failed_frames=failed, error=error)

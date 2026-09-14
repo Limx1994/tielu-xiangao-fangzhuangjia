@@ -47,7 +47,7 @@ try {
     Copy-Item -LiteralPath "tools\ffmpeg" -Destination (Join-Path $stageTarget "tools\ffmpeg") -Recurse -Force
     $ocrTarget = Join-Path $stageTarget "tools\ocr"
     New-Item -ItemType Directory -Force -Path $ocrTarget | Out-Null
-    Get-ChildItem -LiteralPath "tools\ocr" -Force | Where-Object { $_.Name -notin @("ppocr_service.exe", "SHA256SUMS.json") } |
+    Get-ChildItem -LiteralPath "tools\ocr" -Force | Where-Object { $_.Name -notin @("ppocr_service.exe", "SHA256SUMS.json") -and $_.Name -ne ".json" } |
         Copy-Item -Destination $ocrTarget -Recurse -Force
     $checksumPath = Join-Path $ocrTarget "SHA256SUMS.json"
     Remove-Item -LiteralPath (Join-Path $ocrTarget "ppocr_service.exe") -Force -ErrorAction SilentlyContinue
