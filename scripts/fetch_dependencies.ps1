@@ -107,14 +107,12 @@ $positions = New-Object System.Collections.Generic.List[long]
 $sourcePositions = New-Object System.Collections.Generic.List[long]
 $fixedPositions = New-Object System.Collections.Generic.List[long]
 $finalPositions = New-Object System.Collections.Generic.List[long]
-$patchedFound = $false
 $readStream = [IO.File]::Open($workerPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
 try {
     $buffer = New-Object byte[] (4MB)
     $offset = 0L
     while (($count = $readStream.Read($buffer, 0, $buffer.Length)) -gt 0) {
         $text = [Text.Encoding]::ASCII.GetString($buffer, 0, $count)
-        if ($text.Contains($replacement)) { $patchedFound = $true }
         $index = $text.IndexOf($needle, [StringComparison]::Ordinal)
         while ($index -ge 0) {
             $positions.Add($offset + $index)

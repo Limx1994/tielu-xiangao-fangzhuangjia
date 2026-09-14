@@ -11,6 +11,7 @@
 - 自动识别串口设备身份，COM 号变化后自动重新绑定。
 - 使用常驻 `ppocr_worker.exe` 完成本地 OCR，并按中国大陆车牌格式过滤结果。
 - 文本与视频独立重试，使用幂等键和严格回执校验防止误删本地文件。
+- 使用持久化清单索引恢复未完成任务，仅缓存最近 200 条历史事件，避免事件累积后反复全量扫描。
 - 提供本机网页管理、实时预览、摄像头解绑、事件查询、手动重试和开机自启控制。
 - 将摄像头主码流以 MPEG-TS over UDP 单播实时转发，接收端可直接使用 VLC 或 ffplay。
 - 保存配置后立即重建受影响的录像、预览和转发任务；HTTP 监听地址变更除外。
@@ -36,7 +37,7 @@ python app.py
 
 1. 在“添加摄像头”中填写账号、密码并搜索，或手动填写 RTSP 地址。
 2. 如需实时转发，为每路摄像头填写不同的接收端 IP 和 UDP 端口。
-3. 在“完整配置”中检查录像、OCR、串口、存储和上传参数。
+3. 在“系统配置”和“串口触发配置”中检查录像、预览、OCR、串口、存储和上传参数。
 4. 保存配置后确认“系统状态”中的摄像头、串口和转发状态正常。
 5. 在“事件与上传”中查看处理结果，并对失败任务执行手动重试。
 
@@ -57,7 +58,11 @@ python app.py
 | `cameras` | 摄像头身份、RTSP 地址和可选实时转发目标 |
 | `serial_ports` | 串口设备身份、波特率和触发指令 |
 
-网页保存配置后会立即应用运行时参数，并只重建配置发生变化的摄像头任务；`http.host` 和 `http.port` 会保存，但需要重启应用后生效。敏感配置留空表示保持现值，可使用对应的“清除”选项移除已保存值。
+网页为上述配置段提供分组表单，每组单独验证和保存。摄像头可以编辑名称、启停状态、主/预览 RTSP 地址和实时转发目标；串口设备可以新增、编辑、启停和删除。最多配置 2 路摄像头和 16 个串口设备。配置格式版本和已有摄像头 ID 只读，手动新增摄像头时可以选填 ID。
+
+网页保存配置后会立即应用运行时参数，并只重建配置发生变化的摄像头任务；`http.host` 和 `http.port` 会保存，但需要重启应用后生效。敏感配置留空表示保持现值，可使用对应的“清除”选项移除已保存值。直接编辑 `config.json` 时，应先退出应用，修改完成后重新启动；运行中的应用不会自动重新载入外部文件改动。
+
+存在未完成事件时，系统会拒绝停用、删除该摄像头或修改其录像码流，防止事件处理中途失去数据源。应先等待事件完成或在“事件与上传”中处理失败任务。
 
 事件上报地址和事件视频上传地址支持完整的 HTTP/HTTPS URL，也支持裸 IP、端口及路径，例如 `192.168.1.20:8080/report`；裸地址会自动补全为 `http://`。应用的 HTTP/ONVIF 会话不读取环境代理，FFmpeg、FFprobe 和 OCR 子进程也不继承代理变量。Proxifier 等 Winsock 透明代理必须额外将 `XgfzjRecorder.exe`、`python.exe`、`ffmpeg.exe` 和 `ffprobe.exe` 设置为 `Direct`。
 
@@ -73,6 +78,7 @@ VLC 可通过“媒体 → 打开网络串流”使用 `udp://@:5000` 接收。
 
 - `runtime\cache`：循环录像切片。
 - `runtime\events`：可恢复任务清单和事件视频。
+- `runtime\events\.manifest-index.json`：活动任务与最近事件索引；缺失、损坏或与清单不一致时自动重建。
 - `runtime\logs`：应用与 OCR 日志。
 
 修改配置前应备份 `config.json` 和 `runtime\events`。不要手工修改正在处理的事件清单。
@@ -99,7 +105,7 @@ PC -> 设备: XGFZJ:DISCOVER:1\r\n
 
 ## 上传协议
 
-事件端点仅在触发事件后接收 JSON，内容包含事件 ID、摄像头 ID、触发时间、录像覆盖范围和 OCR 结果。视频端点接收 `multipart/form-data`，字段为 `metadata` 和 `file`。两类请求均包含 `Idempotency-Key`。
+事件端点仅在触发事件后接收 JSON，内容包含事件 ID、摄像头 ID、触发时间、录像覆盖范围和 OCR 结果。视频端点接收 `multipart/form-data`，字段为 `metadata` 和 `file`。两类请求均包含 `Idempotency-Key`，各自独立重试；未配置视频端点或没有视频文件时，不阻塞事件文本上报。
 
 成功回执必须包含：
 
@@ -130,7 +136,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1
 - PyInstaller 打包。
 - 打包 EXE 健康检查、就绪检查、首页访问和单实例冒烟测试。
 
-构建会将根目录 `README.md` 和完整 `tools` 运行时复制到发布目录，并从 OCR 发布内容中移除未使用的 `ppocr_service.exe`。若发布目录已有 `config.json`，脚本会在重建期间备份并恢复该配置；构建完成后仍应检查发布目录中没有测试日志和敏感配置。
+构建先在 `dist` 下的临时 staging 目录完成打包和验证，通过后再原子替换 `dist\XgfzjRecorder`；切换失败会恢复旧 release。构建会复制根目录 `README.md` 和所需工具运行时，从 OCR 发布内容中移除未使用的 `ppocr_service.exe`，并针对实际发布文件重新生成和逐项验证 `SHA256SUMS.json`。若旧发布目录已有 `config.json`，脚本会保留该配置；构建完成后仍应检查发布目录中没有测试日志和不应交付的敏感配置。
 
 依赖脚本固定 OCR 上游 commit，生成 SHA-256 清单，并拒绝仍为 Git LFS 指针的必要文件。脚本还会验证并修补上游 worker 的默认 `OCR.yaml` 路径，结果写入 `tools\ocr\WORKER_PATCH.json`。
 
@@ -144,7 +150,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1
 
 ## 安全与限制
 
-- `config.json` 可能包含 RTSP 凭证、服务器 URL 和 Token。网页接口会遮蔽敏感值，但文件本身应限制 Windows ACL，并禁止提交到 Git。
+- `config.json` 可能包含 RTSP 凭证、服务器 URL 和 Token。网页摄像头配置会显示完整 RTSP 地址，上传服务器 URL 和 Token 不回显；配置文件仍应限制 Windows ACL，并禁止提交到 Git。
 - ONVIF 扫描凭证只保存在当前进程内存中；扫描结果不会返回含凭证的 URL。
 - 视频上传采用流式读取，并限制连接、无进展及总时长。
 - 重叠事件可共享受引用计数保护的切片；编码参数不同的切片会拒绝拼接。

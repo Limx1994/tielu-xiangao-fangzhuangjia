@@ -62,6 +62,12 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fetch_dependencies.p
 
 依赖更新成功的判定条件是：必要文件均不是 Git LFS 指针、worker 默认配置路径已经校正、校验清单已重新生成，并且项目 release 构建和 OCR 启动检查通过。
 
+## Release 打包行为
+
+`scripts\build.ps1` 只将应用需要的 OCR 文件复制到 staging release，不包含未使用的 `ppocr_service.exe`，也不会直接复用源码目录中的 `SHA256SUMS.json`。脚本会基于实际发布内容重新生成校验清单，并逐项复算 SHA-256；校验或冒烟测试失败时不会替换已有 release。
+
+因此，源码依赖目录与发布目录的校验清单文件数量可能不同，这是裁剪未使用组件后的预期结果。排查发布包时应以 `dist\XgfzjRecorder\tools\ocr\SHA256SUMS.json` 为准，不应将源码清单直接覆盖到 release。
+
 ## 手工诊断
 
 仅在排错时直接启动 worker：

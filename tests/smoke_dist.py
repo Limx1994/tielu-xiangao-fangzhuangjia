@@ -7,7 +7,11 @@ from pathlib import Path
 
 
 root = Path(__file__).resolve().parents[1]
-dist = Path(sys.argv[1]).resolve() if len(sys.argv) > 1 else root / "dist" / "XgfzjRecorder"
+if len(sys.argv) > 2:
+    raise SystemExit("用法: smoke_dist.py [发布目录]")
+dist = Path(sys.argv[1]).resolve() if len(sys.argv) == 2 else root / "dist" / "XgfzjRecorder"
+if not (dist / "XgfzjRecorder.exe").is_file():
+    raise SystemExit(f"发布程序不存在: {dist / 'XgfzjRecorder.exe'}")
 config_path = dist / "config.json"
 original_config = config_path.read_bytes() if config_path.exists() else None
 base_url = "http://127.0.0.1:5000"

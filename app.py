@@ -1,6 +1,7 @@
 from __future__ import annotations
 import copy
 from collections import deque
+import heapq
 import hashlib
 import ipaddress
 import json
@@ -109,7 +110,7 @@ def deep_merge(base: dict[str, Any], update: dict[str, Any]) -> dict[str, Any]:
         else:
             result[key] = value
     return result
-def process_args(args: list[str]) -> dict[str, Any]: return {"startupinfo": STARTUPINFO, "creationflags": CREATE_NO_WINDOW, "env": direct_environment()}
+def process_args() -> dict[str, Any]: return {"startupinfo": STARTUPINFO, "creationflags": CREATE_NO_WINDOW, "env": direct_environment()}
 def drain_pipe(pipe, sink: deque, sentinel) -> None:
     if pipe:
         sink.extend(iter(pipe.readline, sentinel))
@@ -131,6 +132,7 @@ def find_binary(name: str, bundled: str) -> Path:
 FFMPEG = find_binary("ffmpeg", "tools/ffmpeg/bin/ffmpeg.exe")
 FFPROBE = find_binary("ffprobe", "tools/ffmpeg/bin/ffprobe.exe")
 OCR_DIR = BASE_DIR / "tools" / "ocr"
+def valid_rtsp(value: str) -> bool: parsed = urlparse(value); return parsed.scheme.lower() == "rtsp" and bool(parsed.hostname) and (parsed.port is None or 1 <= parsed.port <= 65535)
 def validate_config(config: dict[str, Any]) -> None:
     try:
         http = config["http"]
@@ -139,8 +141,7 @@ def validate_config(config: dict[str, Any]) -> None:
         if not 0 <= int(rec["pre_seconds"]) <= 3600 or not 0 <= int(rec["post_seconds"]) <= 600: raise ValueError("录像时长超出范围")
         if not 2 <= int(rec["segment_seconds"]) <= 60: raise ValueError("切片时长必须为 2-60 秒")
         preview = config["preview"]
-        if not 160 <= int(preview["width"]) <= 1920 or not 1 <= int(preview["fps"]) <= 15:
-            raise ValueError("预览参数超出范围")
+        if not 160 <= int(preview["width"]) <= 1920 or not 1 <= int(preview["fps"]) <= 15: raise ValueError("预览参数超出范围")
         if not 5 <= int(preview["idle_seconds"]) <= 600: raise ValueError("预览空闲时间必须为 5-600 秒")
         ocr = config["ocr"]
         if not isinstance(ocr["enabled"], bool): raise ValueError("OCR enabled 必须为布尔值")
@@ -149,21 +150,18 @@ def validate_config(config: dict[str, Any]) -> None:
         upload = config["upload"]
         if not isinstance(upload["delete_after_success"], bool): raise ValueError("delete_after_success 必须为布尔值")
         if not 1 <= float(upload["connect_timeout"]) <= 300 or not 1 <= float(upload["read_timeout"]) <= 600 or not 10 <= float(upload["total_timeout"]) <= 86400 or not 1 <= int(upload["max_retries"]) <= 100: raise ValueError("上传超时或重试参数超出范围")
-        for key in ("text_url", "video_url"):
-            normalize_http_endpoint(upload[key])
+        for key in ("text_url", "video_url"): normalize_http_endpoint(upload[key])
         storage = config["storage"]
         if not 0 <= float(storage["reserve_percent"]) <= 50 or not 0 <= int(storage["reserve_bytes"]) or not 30 <= int(storage["cache_keep_seconds"]) <= 86400: raise ValueError("磁盘保留参数超出范围")
         if not isinstance(config.get("cameras"), list) or not isinstance(config.get("serial_ports"), list) or any(not isinstance(item, dict) for item in config["cameras"] + config["serial_ports"]): raise ValueError("设备配置必须为数组对象")
-        if len(config.get("cameras", [])) > 2 or len(config.get("serial_ports", [])) > 16:
-            raise ValueError("设备数量超出限制")
+        if len(config.get("cameras", [])) > 2 or len(config.get("serial_ports", [])) > 16: raise ValueError("设备数量超出限制")
         ids = [str(item.get("id", "")) for item in config.get("cameras", [])]
-        if any(not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", item) for item in ids) or len(ids) != len(set(ids)):
-            raise ValueError("摄像头 ID 无效或重复")
+        if any(not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", item) for item in ids) or len(ids) != len(set(ids)): raise ValueError("摄像头 ID 无效或重复")
         for camera in config.get("cameras", []):
             if "enabled" in camera and not isinstance(camera["enabled"], bool): raise ValueError("摄像头 enabled 必须为布尔值")
-            url = urlparse(camera_url(camera, "rtsp_url"))
-            if url.scheme.lower() != "rtsp" or not url.hostname:
-                raise ValueError(f"摄像头 {camera.get('id')} 的 RTSP 地址无效")
+            for key in ("rtsp_url", "preview_url"):
+                value = str(camera.get(key, ""))
+                if (value or key == "rtsp_url") and not valid_rtsp(value): raise ValueError(f"摄像头 {camera.get('id')} 的 RTSP 地址无效")
         targets = [normalize_udp_target(item.get("forward_url")) for item in config.get("cameras", []) if item.get("forward_url")];
         if len(targets) != len(set(targets)): raise ValueError("实时转发目标不能重复")
         serial_ids = []
@@ -214,7 +212,7 @@ def scrub_message(value: str) -> str:
 def hide_secret(value: str, secret: str) -> str: return value.replace(secret, "***") if secret else value
 def probe_rtsp(value: str, username: str, password: str) -> dict[str, Any]:
     command = [str(FFPROBE), "-v", "error", "-rtsp_transport", "tcp", "-timeout", "5000000", "-select_streams", "v:0", "-show_entries", "stream=codec_name,width,height", "-of", "json", authenticated_url(value, username, password)]
-    try: result = subprocess.run(command, capture_output=True, text=True, timeout=8, **process_args([]))
+    try: result = subprocess.run(command, capture_output=True, text=True, timeout=8, **process_args())
     except Exception as exc: return {"validated": False, "codec": None, "error": scrub_message(hide_secret(str(exc), password))[:160]}
     if result.returncode: return {"validated": False, "codec": None, "error": scrub_message(hide_secret(result.stderr, password))[-160:]}
     streams = json.loads(result.stdout).get("streams", [])
@@ -279,11 +277,9 @@ class ConfigStore:
             "token": bool(upload["token"]),
         }
         for key in ("text_url", "video_url", "token"): upload[key] = ""
-        for camera in data["cameras"]:
-            for key in ("rtsp_url", "preview_url"): camera[key] = scrub_message(str(camera.get(key, "")))
         return data
 def probe_segment(path: Path) -> tuple[float, tuple[Any, ...]]:
-    entries = "format=duration:stream=codec_name,profile,width,height,pix_fmt,level"; result = subprocess.run([str(FFPROBE), "-v", "error", "-select_streams", "v:0", "-show_entries", entries, "-of", "json", str(path)], capture_output=True, text=True, timeout=20, **process_args([]))
+    entries = "format=duration:stream=codec_name,profile,width,height,pix_fmt,level"; result = subprocess.run([str(FFPROBE), "-v", "error", "-select_streams", "v:0", "-show_entries", entries, "-of", "json", str(path)], capture_output=True, text=True, timeout=20, **process_args())
     if result.returncode: raise AppError(result.stderr.strip() or "ffprobe 失败", "PROBE_FAILED", 500)
     data = json.loads(result.stdout); streams = data.get("streams", [])
     if not streams: raise AppError("切片没有视频流", "NO_VIDEO_STREAM", 500)
@@ -329,7 +325,7 @@ class Recorder:
         delay = 1
         while not self.stop.is_set() and not self.closed.is_set():
             try:
-                self.process = subprocess.Popen(self._command(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, **process_args([]))
+                self.process = subprocess.Popen(self._command(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, **process_args())
                 errors: deque[str] = deque(maxlen=20); stderr_pipe = self.process.stderr
                 drain = threading.Thread(target=drain_pipe, args=(stderr_pipe, errors, ""), daemon=True); drain.start()
                 self.status.update(state="running", error=None)
@@ -352,36 +348,26 @@ class Recorder:
         stop_process(self.process)
 class Preview:
     def __init__(self, camera: dict[str, Any], config: dict[str, Any]) -> None:
-        self.camera, self.config = camera, config
-        self.closed = threading.Event()
-        self.lock = threading.Condition()
-        self.frame: bytes | None = None
-        self.viewers = 0
-        self.last_viewer = 0.0
-        self.process: subprocess.Popen | None = None
-        self.thread: threading.Thread | None = None
-        self.mode = "未启动"
+        self.camera, self.config = camera, config; self.closed = threading.Event(); self.lock = threading.Condition()
+        self.frame: bytes | None = None; self.viewers = 0; self.last_viewer = 0.0
+        self.process: subprocess.Popen | None = None; self.thread: threading.Thread | None = None; self.mode = "未启动"
     def subscribe(self) -> Iterable[bytes]:
         with self.lock:
-            self.viewers += 1
-            self.last_viewer = time.time()
+            self.viewers += 1; self.last_viewer = time.time()
             if not self.thread or not self.thread.is_alive():
-                self.thread = threading.Thread(target=self._run, name=f"preview-{self.camera['id']}", daemon=True)
-                self.thread.start()
+                self.thread = threading.Thread(target=self._run, name=f"preview-{self.camera['id']}", daemon=True); self.thread.start()
         try:
             last = None
-            while True:
+            while not self.closed.is_set():
                 with self.lock:
-                    self.lock.wait_for(lambda last=last: self.frame is not None and self.frame is not last, timeout=5)
-                    frame = self.frame
-                    self.last_viewer = time.time()
+                    self.lock.wait_for(lambda last=last: self.closed.is_set() or self.frame is not None and self.frame is not last, timeout=5)
+                    if self.closed.is_set(): break
+                    frame = self.frame; self.last_viewer = time.time()
                 if frame:
-                    last = frame
-                    yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+                    last = frame; yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
         finally:
             with self.lock:
-                self.viewers = max(0, self.viewers - 1)
-                self.last_viewer = time.time()
+                self.viewers = max(0, self.viewers - 1); self.last_viewer = time.time()
     def _commands(self) -> Iterable[tuple[str, list[str]]]:
         url = camera_url(self.camera, "preview_url")
         common = ["-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp", "-timeout", "15000000", "-fflags", "nobuffer"]
@@ -394,7 +380,7 @@ class Preview:
                 return
             try:
                 self.mode = mode
-                self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **process_args([]))
+                self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **process_args())
                 chunks: queue.Queue[bytes] = queue.Queue(maxsize=32); process = self.process; errors: deque[bytes] = deque(maxlen=20)
                 threading.Thread(target=pipe_chunks, args=(process.stdout, chunks), daemon=True).start()
                 threading.Thread(target=drain_pipe, args=(process.stderr, errors, b""), daemon=True).start()
@@ -428,47 +414,41 @@ class Preview:
             self.thread = threading.Thread(target=self._run, name=f"preview-{self.camera['id']}", daemon=True); self.thread.start()
     def close(self) -> None:
         self.closed.set()
+        with self.lock: self.lock.notify_all()
         stop_process(self.process)
 class OCRClient:
     plate_pattern = re.compile(r"^[\u4e00-\u9fff][A-Z][A-Z0-9]{5,6}$")
     def __init__(self, config: dict[str, Any], stop: threading.Event) -> None:
         self.config, self.stop = config, stop
         self.process: subprocess.Popen | None = None
-        self.lock = threading.RLock()
-        self.log_stream = None
-    def ensure_service(self) -> None:
-        if not self.config["ocr"]["enabled"]:
-            raise AppError("OCR 已禁用", "OCR_DISABLED", 409)
+        self.lock = threading.RLock(); self.log_stream = None; self.process_threads: int | None = None
+    def ensure_service(self, enabled: bool | None = None) -> None:
+        if self.stop.is_set(): raise AppError("服务正在退出", "SHUTTING_DOWN", 503)
+        if not (self.config["ocr"]["enabled"] if enabled is None else enabled): raise AppError("OCR 已禁用", "OCR_DISABLED", 409)
         exe = OCR_DIR / "ppocr_worker.exe"
         model = OCR_DIR / "models" / "plate_rtdetr.onnx"
-        if not exe.exists() or exe.stat().st_size < 100_000 or not model.exists() or model.stat().st_size < 1_000_000:
-            raise AppError("OCR 成品或模型不存在/仍是 Git LFS 指针", "OCR_MISSING", 503)
-        if self.process and self.process.poll() is None:
-            return
+        if not exe.exists() or exe.stat().st_size < 100_000 or not model.exists() or model.stat().st_size < 1_000_000: raise AppError("OCR 成品或模型不存在/仍是 Git LFS 指针", "OCR_MISSING", 503)
+        threads = int(self.config["ocr"]["cpu_threads"])
+        if self.process and self.process.poll() is None and self.process_threads == threads: return
         if self.process or self.log_stream: self.close()
-        args = [str(exe), "--model_dir", str(OCR_DIR / "models"), "--cpu_threads", str(self.config["ocr"]["cpu_threads"]), "--use_doc_orientation", "false"]
+        if self.stop.is_set(): raise AppError("服务正在退出", "SHUTTING_DOWN", 503)
+        args = [str(exe), "--model_dir", str(OCR_DIR / "models"), "--cpu_threads", str(threads), "--use_doc_orientation", "false"]
         ocr_log = LOG_DIR / "ocr.log"
         if ocr_log.exists() and ocr_log.stat().st_size >= 5_000_000: os.replace(ocr_log, LOG_DIR / "ocr.log.1")
         self.log_stream = ocr_log.open("a", encoding="utf-8")
-        self.process = subprocess.Popen(args, cwd=OCR_DIR, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log_stream, text=True, encoding="utf-8", errors="replace", bufsize=1, **process_args([]))
+        self.process = subprocess.Popen(args, cwd=OCR_DIR, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log_stream, text=True, encoding="utf-8", errors="replace", bufsize=1, **process_args()); self.process_threads = threads
         ready = read_line_timeout(self.process, 30)
-        if ready.strip() != "READY":
-            self.close()
-            raise AppError(f"OCR worker 启动失败: {ready.strip() or '无响应'}", "OCR_START_FAILED", 503)
+        if ready.strip() != "READY": self.close(); raise AppError(f"OCR worker 启动失败: {ready.strip() or '无响应'}", "OCR_START_FAILED", 503)
     def recognize(self, jpeg: bytes, config: dict[str, Any] | None = None) -> dict[str, Any]:
         with self.lock:
-            if config is not None: self.config = config
-            self.ensure_service()
+            self.ensure_service() if config is None else self.ensure_service(config["ocr"]["enabled"])
             frame_path = RUNTIME_DIR / f"ocr-{uuid.uuid4().hex}.jpg"
             try:
                 frame_path.write_bytes(jpeg)
-                if not self.process or not self.process.stdin:
-                    raise OSError("OCR worker stdin 不可用")
-                self.process.stdin.write(str(frame_path) + "\n")
-                self.process.stdin.flush()
+                if not self.process or not self.process.stdin: raise OSError("OCR worker stdin 不可用")
+                self.process.stdin.write(str(frame_path) + "\n"); self.process.stdin.flush()
                 line = read_line_timeout(self.process, 30)
-                if not line.startswith("OK "):
-                    raise AppError(line[4:].strip() if line.startswith("ERR ") else "OCR worker 响应无效", "OCR_FAILED", 502)
+                if not line.startswith("OK "): raise AppError(line[4:].strip() if line.startswith("ERR ") else "OCR worker 响应无效", "OCR_FAILED", 502)
                 payload = json.loads(line[3:]); merged: dict[str, list[Any]] = {"rec_texts": [], "rec_scores": []}
                 for result in payload.get("results", []):
                     nested = result.get("result"); texts = re.search(r'"rec_texts"\s*:\s*(\[[^\]]*\])', nested) if isinstance(nested, str) else None; scores = re.search(r'"rec_scores"\s*:\s*(\[[^\]]*\])', nested) if isinstance(nested, str) else None
@@ -476,15 +456,13 @@ class OCRClient:
                     merged["rec_texts"].extend(result.get("rec_texts", [])); merged["rec_scores"].extend(result.get("rec_scores", []))
                 return merged
             except (OSError, ValueError, json.JSONDecodeError, queue.Empty) as exc:
-                if self.process and self.process.poll() is None:
-                    self.process.terminate()
+                if self.process and self.process.poll() is None: self.process.terminate()
                 raise AppError(f"OCR 通信失败: {exc}", "OCR_IO", 502) from exc
             finally:
                 frame_path.unlink(missing_ok=True)
     def close(self) -> None:
         with self.lock:
-            stop_process(self.process)
-            self.process = None
+            stop_process(self.process); self.process = None; self.process_threads = None
             if self.log_stream: self.log_stream.close(); self.log_stream = None
 def read_line_timeout(process: subprocess.Popen, timeout: float) -> str:
     result: queue.Queue[str] = queue.Queue(maxsize=1)
@@ -497,7 +475,7 @@ def read_line_timeout(process: subprocess.Popen, timeout: float) -> str:
         raise AppError("OCR worker 响应超时", "OCR_TIMEOUT", 504) from None
 def jpeg_frames(video: Path, fps: int) -> Iterable[tuple[float, bytes]]:
     command = [str(FFMPEG), "-hide_banner", "-loglevel", "error", "-i", str(video), "-vf", f"fps={fps}", "-q:v", "4", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **process_args([])); errors: deque[bytes] = deque(maxlen=20)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **process_args()); errors: deque[bytes] = deque(maxlen=20)
     drain = threading.Thread(target=drain_pipe, args=(process.stderr, errors, b""), daemon=True); drain.start()
     buffer, index = bytearray(), 0
     try:
@@ -538,8 +516,9 @@ class Runtime:
         self.serial_status: dict[str, dict[str, Any]] = {}
         self.protected: dict[Path, int] = {}
         self.protected_lock = threading.Lock()
-        self.queue_sets = {name: set() for name in ("stitch", "ocr", "upload")}
-        self.queue_lock = threading.Lock()
+        self.queue_sets = {name: set() for name in ("stitch", "ocr", "upload")}; self.upload_reruns: dict[str, set[str]] = {}
+        self.queue_lock = threading.RLock(); self.delay_condition = threading.Condition(self.queue_lock)
+        self.delayed: list[tuple[float, int, str, Path]] = []; self.delay_seq = 0; self.delay_limit = 1000
         self.queues = {name: queue.Queue(maxsize=1000) for name in self.queue_sets}
         self.scan_lock = threading.Lock()
         self.scan_auth = ("", "")
@@ -548,13 +527,13 @@ class Runtime:
         self.accepting_events = True
         self.ocr_client = OCRClient(self.config, self.stop)
     def start(self) -> None:
-        if not FFMPEG.exists() or not FFPROBE.exists():
-            self.add_error("FFmpeg/ffprobe 不存在，录像功能不可用")
+        if not FFMPEG.exists() or not FFPROBE.exists(): self.add_error("FFmpeg/ffprobe 不存在，录像功能不可用")
         usage = shutil.disk_usage(BASE_DIR)
         reserve = max(int(usage.total * float(self.config["storage"]["reserve_percent"]) / 100), int(self.config["storage"]["reserve_bytes"]))
         self._set_disk_state(usage.free >= reserve)
         self._start_recorders()
         self._start_serials()
+        self.delay_thread = threading.Thread(target=self._delay_worker, name="worker-delay", daemon=True); self.delay_thread.start()
         for stage, target in (("stitch", self._stitch_worker), ("ocr", self._ocr_worker), ("upload", self._upload_worker)):
             threading.Thread(target=target, name=f"worker-{stage}", daemon=True).start()
         threading.Thread(target=self._maintenance, name="maintenance", daemon=True).start()
@@ -562,20 +541,30 @@ class Runtime:
     def apply_config(self, config: dict[str, Any], secrets_update: dict[str, str] | None = None, clear_secrets: Iterable[str] | None = None) -> dict[str, Any]:
         with self.config_lock: return self._apply_config(config, secrets_update, clear_secrets)
     def _apply_config(self, config: dict[str, Any], secrets_update: dict[str, str] | None, clear_secrets: Iterable[str] | None) -> dict[str, Any]:
-        old = self.config
-        removed = {item["id"] for item in old.get("cameras", [])} - {item["id"] for item in config.get("cameras", [])}
-        if removed and any(item.get("camera_id") in removed and item.get("recording", {}).get("status") in ("waiting", "pending") for item in self.manifests.iter_all()): raise AppError("摄像头仍有等待拼接的事件，暂不能解绑", "CAMERA_BUSY", 409)
-        saved = self.config_store.save(config, secrets_update, clear_secrets)
-        self.config = saved
+        old = self.config; old_cams = {item["id"]: item for item in old.get("cameras", [])}; new_cams = {item["id"]: item for item in config.get("cameras", [])}
+        for camera_id, before in old_cams.items():
+            after = new_cams.get(camera_id)
+            value = camera_url(after, "rtsp_url") if after else ""
+            if re.match(r"rtsp://\*\*\*@", value, re.I): value = camera_url(before, "rtsp_url")
+            blocked = not after or not after.get("enabled", True) or value != camera_url(before, "rtsp_url")
+            if blocked and any(item.get("camera_id") == camera_id and item.get("recording", {}).get("status") in ("waiting", "pending") for item in self.manifests.iter_all()): raise AppError("摄像头仍有等待拼接的事件，暂不能停用或更换主码流", "CAMERA_BUSY", 409)
+        saved = self.config_store.save(config, secrets_update, clear_secrets); self.config = saved
         try:
-            if old.get("cameras") != saved.get("cameras") or old.get("recording") != saved.get("recording") or old.get("preview") != saved.get("preview"):
-                for item in (*self.recorders.values(), *self.previews.values(), *self.forwarders.values()): item.close()
-                self.recorders.clear(); self.previews.clear(); self.forwarders.clear()
-                self._start_recorders()
-            if old.get("serial_ports") != saved.get("serial_ports"):
-                self._start_serials()
-            if old.get("ocr", {}).get("enabled") != saved["ocr"]["enabled"] or old.get("ocr", {}).get("cpu_threads") != saved["ocr"]["cpu_threads"]: self.ocr_client.close()
-            self.ocr_client.config = saved
+            old_cams = {item["id"]: item for item in old.get("cameras", [])}; new_cams = {item["id"]: item for item in saved.get("cameras", [])}
+            for camera_id, item in list(self.recorders.items()):
+                before, after = old_cams.get(camera_id, {}), new_cams.get(camera_id)
+                if not after or not after.get("enabled", True) or old["recording"] != saved["recording"] or camera_url(before, "rtsp_url") != camera_url(after, "rtsp_url"): item.close(); self.recorders.pop(camera_id, None)
+            for camera_id, item in list(self.previews.items()):
+                before, after = old_cams.get(camera_id, {}), new_cams.get(camera_id)
+                if not after or not after.get("enabled", True) or old["preview"] != saved["preview"] or camera_url(before, "preview_url") != camera_url(after, "preview_url"): item.close(); self.previews.pop(camera_id, None)
+            for camera_id, item in list(getattr(self, "forwarders", {}).items()):
+                before, after = old_cams.get(camera_id, {}), new_cams.get(camera_id)
+                if not after or not after.get("enabled", True) or not after.get("forward_url") or camera_url(before, "rtsp_url") != camera_url(after, "rtsp_url") or before.get("forward_url") != after.get("forward_url"): item.close(); self.forwarders.pop(camera_id, None)
+            self._start_recorders()
+            if old.get("serial_ports") != saved.get("serial_ports"): self._start_serials()
+            with getattr(self.ocr_client, "lock", threading.RLock()):
+                if old.get("ocr", {}).get("enabled") != saved["ocr"]["enabled"] or old.get("ocr", {}).get("cpu_threads") != saved["ocr"]["cpu_threads"]: self.ocr_client.close()
+                self.ocr_client.config = saved
             public = self.config_store.public(); public["restart_required"] = saved["http"] != self.bound_http
             return public
         except Exception:
@@ -591,7 +580,7 @@ class Runtime:
                 if self.accepting_events and (not current or current.closed.is_set()):
                     recorder = Recorder(camera, self.config, self.stop); self.recorders[camera["id"]] = recorder; recorder.start()
                 if camera["id"] not in self.previews: self.previews[camera["id"]] = Preview(camera, self.config)
-                if camera.get("forward_url") and camera["id"] not in self.forwarders: forwarder = StreamForwarder(camera, FFMPEG, self.stop, process_args([])); self.forwarders[camera["id"]] = forwarder; forwarder.start()
+                if camera.get("forward_url") and camera["id"] not in self.forwarders: forwarder = StreamForwarder(camera, FFMPEG, self.stop, process_args()); self.forwarders[camera["id"]] = forwarder; forwarder.start()
     def _start_serials(self) -> None:
         self.serial_generation += 1; generation = self.serial_generation
         with self.serial_lock: self.serial_status = {}
@@ -692,24 +681,37 @@ class Runtime:
                 count = self.protected.get(path, 0) - 1
                 if count > 0: self.protected[path] = count
                 else: self.protected.pop(path, None)
-    def _enqueue(self, stage: str, path: Path, delay: float = 0) -> None:
-        key = str(path)
-        with self.queue_lock:
-            if key in self.queue_sets[stage]: return
+    def _enqueue(self, stage: str, path: Path, delay: float = 0) -> bool:
+        key = str(path); condition = getattr(self, "delay_condition", threading.RLock())
+        with condition:
+            if key in self.queue_sets[stage]: return True
             self.queue_sets[stage].add(key)
-        def put() -> None:
-            try: self.queues[stage].put_nowait(path)
-            except queue.Full:
-                with self.queue_lock: self.queue_sets[stage].discard(key)
-                self.add_error(f"{stage} 队列已满，任务暂缓: {path}")
-        if delay:
-            timer = threading.Timer(delay, put)
-            timer.daemon = True
-            timer.start()
-        else:
-            put()
+            if not delay:
+                try: self.queues[stage].put_nowait(path); return True
+                except queue.Full: pass
+            if not hasattr(self, "delayed"):
+                self.queue_sets[stage].discard(key); self.add_error(f"{stage} 队列已满，任务暂缓: {path}"); return False
+            if len(self.delayed) >= self.delay_limit: self.queue_sets[stage].discard(key); self.add_error(f"延迟调度器已满，任务暂缓: {stage} {path}"); return False
+            self.delay_seq += 1; heapq.heappush(self.delayed, (time.monotonic() + delay, self.delay_seq, stage, path)); condition.notify(); return True
+    def _delay_worker(self) -> None:
+        while not self.stop.is_set():
+            with self.delay_condition:
+                while not self.delayed and not self.stop.is_set(): self.delay_condition.wait()
+                if self.stop.is_set(): return
+                due, sequence, stage, path = self.delayed[0]; remaining = due - time.monotonic()
+                if remaining > 0: self.delay_condition.wait(remaining); continue
+                try: self.queues[stage].put_nowait(path); heapq.heappop(self.delayed)
+                except queue.Full: heapq.heapreplace(self.delayed, (time.monotonic() + 0.25, sequence, stage, path)); self.delay_condition.wait(0.25)
     def _done_queue(self, stage: str, path: Path) -> None:
-        with self.queue_lock: self.queue_sets[stage].discard(str(path))
+        key = str(path); condition = getattr(self, "delay_condition", threading.RLock()); reruns = getattr(self, "upload_reruns", {})
+        with condition:
+            if isinstance(reruns, set): reruns = {item: set() for item in reruns}
+            self.upload_reruns = reruns; rerun = reruns.pop(key, set()) if stage == "upload" and not self.stop.is_set() else set()
+            self.queue_sets[stage].discard(key); condition.notify() if hasattr(condition, "notify") else None; rerun = {item for item in rerun if self.manifests.load(path)[item]["status"] != "complete"}
+            if rerun:
+                try: self._reset_upload(path, rerun); accepted = self._enqueue("upload", path)
+                except Exception as exc: self.add_error(f"上传重试重新入队失败 {path}: {exc}")
+                else: self._restore_upload_retry(path, rerun, "上传重试重新入队失败") if not accepted else None
         self.queues[stage].task_done()
     def _stitch_worker(self) -> None:
         while not self.stop.is_set():
@@ -721,11 +723,9 @@ class Runtime:
                 protected = [Path(value) for value in manifest.get("protected_segments", [])]
                 camera_id, coverage = manifest["camera_id"], manifest["coverage"]
                 recorder = self.recorders.get(camera_id)
-                if not recorder:
-                    raise AppError("摄像头录像器不存在", "RECORDER_MISSING", 500)
+                if not recorder: raise AppError("摄像头录像器不存在", "RECORDER_MISSING", 500)
                 segments = [item for item in recorder.closed_segments() if item[2] >= coverage["requested_start"] and item[1] <= coverage["requested_end"]]
-                if not segments:
-                    raise AppError("目标时间范围没有可用切片", "NO_SEGMENTS", 500)
+                if not segments: raise AppError("目标时间范围没有可用切片", "NO_SEGMENTS", 500)
                 if len({recorder.segment_info(item[0])[1] for item in segments}) != 1:
                     raise AppError("事件切片编码参数不一致，拒绝拼接", "INCOMPATIBLE_SEGMENTS", 409)
                 extra = [item[0] for item in segments if item[0] not in protected]
@@ -735,9 +735,8 @@ class Runtime:
                 list_path.write_text("".join(f"file '{str(item[0]).replace(chr(39), chr(39)+chr(92)+chr(39)+chr(39))}'\n" for item in segments), encoding="utf-8")
                 output = Path(manifest["video_path"])
                 command = [str(FFMPEG), "-hide_banner", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(list_path), "-map", "0:v:0", "-an", "-c", "copy", "-movflags", "+faststart", "-y", str(output)]
-                result = subprocess.run(command, capture_output=True, text=True, timeout=300, **process_args([]))
-                if result.returncode or not output.exists() or output.stat().st_size == 0:
-                    raise AppError(result.stderr[-1000:] or "视频拼接失败", "STITCH_FAILED", 500)
+                result = subprocess.run(command, capture_output=True, text=True, timeout=300, **process_args())
+                if result.returncode or not output.exists() or output.stat().st_size == 0: raise AppError(result.stderr[-1000:] or "视频拼接失败", "STITCH_FAILED", 500)
                 probe_duration(output)
                 coverage.update(actual_start=segments[0][1], actual_end=segments[-1][2])
                 coverage["complete"] = coverage["actual_start"] <= coverage["requested_start"] and coverage["actual_end"] >= coverage["requested_end"]
@@ -747,24 +746,22 @@ class Runtime:
                 self.manifests.save(manifest)
                 logger.info("事件 %s/%s 拼接完成，完整=%s", manifest["event_id"], camera_id, coverage["complete"])
                 self._enqueue("ocr", path)
-            except Exception as exc:
-                self._fail_manifest(path, "recording", exc)
-            finally:
-                self._release(protected)
-                self._done_queue("stitch", path)
+            except Exception as exc: self._fail_manifest(path, "recording", exc)
+            finally: self._release(protected); self._done_queue("stitch", path)
     def _ocr_worker(self) -> None:
         while not self.stop.is_set():
             try: path = self.queues["ocr"].get(timeout=1)
             except queue.Empty: continue
             try:
+                if self.stop.is_set(): return
                 manifest = self.manifests.load(path)
-                if manifest["recording"]["status"] != "complete":
-                    continue
+                if manifest["recording"]["status"] != "complete": continue
                 config = manifest["config"]
                 plates: dict[str, dict[str, Any]] = {}
                 frames = failed = 0
                 if config["ocr"]["enabled"]:
                     for timestamp, jpeg in jpeg_frames(Path(manifest["video_path"]), int(config["ocr"]["fps"])):
+                        if self.stop.is_set(): return
                         frames += 1
                         try:
                             data = self.ocr_client.recognize(jpeg, config)
@@ -774,8 +771,7 @@ class Runtime:
                                 score = float(score)
                                 if score >= float(config["ocr"]["confidence"]) and OCRClient.plate_pattern.fullmatch(plate):
                                     current = plates.get(plate)
-                                    if not current or score > current["confidence"]:
-                                        plates[plate] = {"text": plate, "confidence": score, "timestamp": timestamp}
+                                    if not current or score > current["confidence"]: plates[plate] = {"text": plate, "confidence": score, "timestamp": timestamp}
                         except Exception as exc:
                             failed += 1
                             logger.warning("OCR 帧失败 %s %.3f: %s", manifest["event_id"], timestamp, exc)
@@ -787,9 +783,11 @@ class Runtime:
                 self._enqueue("upload", path)
             except Exception as exc:
                 self._fail_manifest(path, "ocr", exc)
-                try: self._enqueue("upload", path)
-                except Exception as queue_exc: self.add_error(f"上传入队失败: {queue_exc}")
+                self._enqueue("upload", path)
             finally:
+                try:
+                    with getattr(self.ocr_client, "lock", threading.RLock()): self.ocr_client.close() if not self.stop.is_set() and getattr(self.ocr_client, "config", {}).get("ocr", {}).get("enabled") is False else None
+                except Exception as exc: self.add_error(f"OCR 禁用后关闭 worker 失败: {exc}")
                 self._done_queue("ocr", path)
     def _upload_worker(self) -> None:
         while not self.stop.is_set():
@@ -799,52 +797,46 @@ class Runtime:
             except Exception as exc: self.add_error(f"上传任务异常 {path}: {exc}")
             finally: self._done_queue("upload", path)
     def _upload(self, path: Path) -> None:
-        manifest = self.manifests.load(path)
-        upload = manifest["config"]["upload"]
-        video = Path(manifest["video_path"])
-        if not video.exists():
-            self._fail_manifest(path, "video_upload", AppError("视频文件不存在", "VIDEO_MISSING", 500), terminal=True)
-            return
+        manifest = self.manifests.load(path); upload = manifest["config"]["upload"]; video = Path(manifest["video_path"])
         payload = {key: manifest[key] for key in ("event_id", "camera_id", "trigger_time", "coverage", "ocr")}
         headers = {"Idempotency-Key": f"{manifest['event_id']}:{manifest['camera_id']}:text"}
-        token = upload.get("token")
+        token = upload.get("token"); text_url, video_url = upload.get("text_url"), upload.get("video_url")
         if token: headers["Authorization"] = f"Bearer {token}"
-        text_url, video_url = upload.get("text_url"), upload.get("video_url")
-        if not text_url or not video_url:
-            self._mark_waiting(manifest, "text_upload", "服务器地址未配置", terminal=True)
-            self._mark_waiting(manifest, "video_upload", "服务器地址未配置", terminal=True)
-            self.manifests.save(manifest); return
-        session = direct_session()
-        timeout = Timeout(connect=float(upload["connect_timeout"]), read=float(upload["read_timeout"]), total=float(upload["total_timeout"]))
-        if manifest["text_upload"]["status"] != "complete":
-            try:
-                response = session.post(text_url, json=payload, headers=headers, timeout=timeout)
-                receipt = self._check_receipt(response, manifest, video=False)
-                manifest["text_upload"].update(status="complete", error=None, receipt=receipt)
-            except Exception as exc:
-                self._retry_state(manifest, "text_upload", exc); self.manifests.save(manifest)
-            self.manifests.save(manifest)
-        if manifest["video_upload"]["status"] != "complete":
-            digest = sha256_file(video)
-            meta = json.dumps({**payload, "sha256": digest, "size": video.stat().st_size}, ensure_ascii=False)
-            video_headers = {**headers, "Idempotency-Key": f"{manifest['event_id']}:{manifest['camera_id']}:video"}
-            try:
-                with video.open("rb") as stream:
-                    body = DeadlineBody(MultipartEncoder(fields={"metadata": meta, "file": (video.name, stream, "video/mp4")}), float(upload["total_timeout"]))
-                    video_headers["Content-Type"] = body.content_type
-                    response = session.post(video_url, data=body, headers=video_headers, timeout=timeout)
-                receipt = self._check_receipt(response, manifest, video=True, size=video.stat().st_size, digest=digest)
-                manifest["video_upload"].update(status="complete", error=None, receipt=receipt)
-            except Exception as exc:
-                self._retry_state(manifest, "video_upload", exc); self.manifests.save(manifest)
-            self.manifests.save(manifest)
-        if upload.get("delete_after_success") and manifest["text_upload"]["status"] == manifest["video_upload"]["status"] == "complete":
-            try: video.unlink(missing_ok=True)
-            except OSError as exc:
-                manifest.update(delete_error=str(exc), cleanup_next_retry=time.time() + 60); self.add_error(f"已上传视频清理失败 {video}: {exc}")
-            else: manifest.update(local_deleted_at=utc_now(), delete_error=None, cleanup_next_retry=0)
-            self.manifests.save(manifest)
-        session.close()
+        session = direct_session(); timeout = Timeout(connect=float(upload["connect_timeout"]), read=float(upload["read_timeout"]), total=float(upload["total_timeout"]))
+        try:
+            if manifest["text_upload"]["status"] != "complete":
+                if not text_url: self._mark_waiting(manifest, "text_upload", "文本服务器地址未配置")
+                else:
+                    try:
+                        response = session.post(text_url, json=payload, headers=headers, timeout=timeout)
+                        receipt = self._check_receipt(response, manifest, video=False); manifest["text_upload"].update(status="complete", error=None, receipt=receipt)
+                    except Exception as exc: self._retry_state(manifest, "text_upload", exc)
+                self.manifests.save(manifest)
+            if manifest["video_upload"]["status"] != "complete":
+                if not video_url: self._mark_waiting(manifest, "video_upload", "视频服务器地址未配置")
+                elif not video.exists(): self._mark_waiting(manifest, "video_upload", "视频文件不存在")
+                else:
+                    try:
+                        stat = video.stat(); info = manifest.get("video_file", {})
+                        if info.get("size") == stat.st_size and info.get("mtime_ns") == stat.st_mtime_ns and info.get("sha256"): digest = info["sha256"]
+                        else:
+                            digest = sha256_file(video); checked = video.stat()
+                            if (checked.st_size, checked.st_mtime_ns) != (stat.st_size, stat.st_mtime_ns): raise AppError("视频文件计算摘要期间发生变化", "VIDEO_CHANGED", 409)
+                            manifest["video_file"] = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns, "sha256": digest}; self.manifests.save(manifest)
+                        size = stat.st_size; meta = json.dumps({**payload, "sha256": digest, "size": size}, ensure_ascii=False)
+                        video_headers = {**headers, "Idempotency-Key": f"{manifest['event_id']}:{manifest['camera_id']}:video"}
+                        with video.open("rb") as stream:
+                            body = DeadlineBody(MultipartEncoder(fields={"metadata": meta, "file": (video.name, stream, "video/mp4")}), float(upload["total_timeout"])); video_headers["Content-Type"] = body.content_type
+                            response = session.post(video_url, data=body, headers=video_headers, timeout=timeout)
+                        receipt = self._check_receipt(response, manifest, video=True, size=size, digest=digest); manifest["video_upload"].update(status="complete", error=None, receipt=receipt)
+                    except Exception as exc: self._retry_state(manifest, "video_upload", exc)
+                self.manifests.save(manifest)
+            if upload.get("delete_after_success") and manifest["text_upload"]["status"] == manifest["video_upload"]["status"] == "complete":
+                try: video.unlink(missing_ok=True)
+                except OSError as exc: manifest.update(delete_error=str(exc), cleanup_next_retry=time.time() + 60); self.add_error(f"已上传视频清理失败 {video}: {exc}")
+                else: manifest.update(local_deleted_at=utc_now(), delete_error=None, cleanup_next_retry=0)
+                self.manifests.save(manifest)
+        finally: session.close()
     def _check_receipt(self, response: requests.Response, manifest: dict[str, Any], video: bool, size: int = 0, digest: str = "") -> dict[str, Any]:
         if not 200 <= response.status_code < 300:
             error = AppError(f"HTTP {response.status_code}: {scrub_message(response.text[:300])}", "UPLOAD_HTTP", response.status_code)
@@ -860,41 +852,49 @@ class Runtime:
         state, limit = manifest[key], int(manifest["config"]["upload"]["max_retries"])
         state["attempts"] += 1
         retryable = getattr(exc, "retryable", True)
-        if not retryable or state["attempts"] >= limit:
-            state.update(status="attention", next_retry=0, error=str(exc))
-        else:
-            delay = min(30 * (2 ** (state["attempts"] - 1)), 3600)
-            state.update(status="retry", next_retry=time.time() + delay, error=str(exc))
+        if not retryable or state["attempts"] >= limit: state.update(status="attention", next_retry=0, error=str(exc))
+        else: delay = min(30 * (2 ** (state["attempts"] - 1)), 3600); state.update(status="retry", next_retry=time.time() + delay, error=str(exc))
         logger.warning("事件 %s/%s %s=%s，尝试=%s，原因=%s", manifest["event_id"], manifest["camera_id"], key, state["status"], state["attempts"], type(exc).__name__)
-    def _mark_waiting(self, manifest: dict[str, Any], key: str, message: str, terminal: bool = False) -> None:
-        manifest[key].update(status="attention" if terminal else "retry", next_retry=0 if terminal else time.time() + 30, error=message)
-    def _fail_manifest(self, path: Path, key: str, exc: Exception, terminal: bool = True) -> None:
+    def _mark_waiting(self, manifest: dict[str, Any], key: str, message: str) -> None:
+        manifest[key].update(status="attention", next_retry=0, error=message)
+    def _fail_manifest(self, path: Path, key: str, exc: Exception) -> None:
         logger.error("事件阶段失败 %s %s: %s", key, path, scrub_message(str(exc)))
         try:
             manifest = self.manifests.load(path)
             if key in ("recording", "ocr"):
                 manifest[key].update(status="failed", error=str(exc))
-                if key == "recording": manifest["protected_segments"] = []
-            else:
-                self._mark_waiting(manifest, key, str(exc), terminal)
+                if key == "recording":
+                    manifest["protected_segments"] = []; reason = f"前置录像失败: {exc}"
+                    if manifest["ocr"]["status"] in ("pending", "waiting"): manifest["ocr"].update(status="failed", error=manifest["ocr"].get("error") or reason)
+                    for stage in ("text_upload", "video_upload"):
+                        if manifest[stage]["status"] == "pending": self._mark_waiting(manifest, stage, manifest[stage].get("error") or reason)
+            else: self._mark_waiting(manifest, key, str(exc))
             self.manifests.save(manifest)
-        except Exception:
-            logger.error("清单错误写入失败 %s\n%s", path, traceback.format_exc())
+        except Exception: logger.error("清单错误写入失败 %s\n%s", path, traceback.format_exc())
+    def _reset_upload(self, path: Path, stages: set[str] | None = None) -> None:
+        manifest = self.manifests.load(path); manifest["config"]["upload"] = copy.deepcopy(self.config["upload"])
+        for key in stages if stages is not None else {key for key in ("text_upload", "video_upload") if manifest[key]["status"] != "complete"}: manifest[key].update(status="pending", attempts=0, next_retry=0, error=None, receipt=None)
+        self.manifests.save(manifest)
+    def _restore_upload_retry(self, path: Path, stages: set[str], message: str) -> None:
+        manifest = self.manifests.load(path)
+        for key in stages: manifest[key].update(status="retry", next_retry=time.time() + 10, error=message)
+        self.manifests.save(manifest)
     def retry(self, event_id: str, camera_id: str) -> None:
         path = self.manifests.path(event_id, camera_id)
         if not path.exists(): raise AppError("事件不存在", "NOT_FOUND", 404)
-        manifest = self.manifests.load(path)
-        manifest["config"]["upload"] = copy.deepcopy(self.config["upload"])
-        for key in ("text_upload", "video_upload"):
-            if manifest[key]["status"] != "complete": manifest[key].update(status="pending", attempts=0, next_retry=0, error=None)
-        self.manifests.save(manifest); self._enqueue("upload", path)
+        key = str(path); condition = getattr(self, "delay_condition", threading.RLock()); reruns = getattr(self, "upload_reruns", {})
+        with condition:
+            if isinstance(reruns, set): reruns = {item: set() for item in reruns}
+            self.upload_reruns = reruns; manifest = self.manifests.load(path); stages = {stage for stage in ("text_upload", "video_upload") if manifest[stage]["status"] != "complete"}
+            if key in self.queue_sets["upload"]:
+                self.upload_reruns.setdefault(key, set()).update(stages); return
+            self._reset_upload(path, stages)
+            if not self._enqueue("upload", path):
+                self._restore_upload_retry(path, stages, "上传队列繁忙，等待自动重试"); raise AppError("上传队列已满", "QUEUE_FULL", 503)
     def _recover(self) -> None:
         for manifest in self.manifests.iter_all():
             path = self.manifests.path(manifest["event_id"], manifest["camera_id"])
-            if manifest["recording"]["status"] in ("waiting", "pending"):
-                self._protect(Path(value) for value in manifest.get("protected_segments", []) if Path(value).exists())
-                delay = max(0, float(manifest["coverage"]["requested_end"]) + float(manifest["config"]["recording"]["segment_seconds"]) + 1 - time.time())
-                self._enqueue("stitch", path, delay)
+            if manifest["recording"]["status"] in ("waiting", "pending"): self._protect(Path(value) for value in manifest.get("protected_segments", []) if Path(value).exists()); delay = max(0, float(manifest["coverage"]["requested_end"]) + float(manifest["config"]["recording"]["segment_seconds"]) + 1 - time.time()); self._enqueue("stitch", path, delay)
             elif manifest["ocr"]["status"] == "pending": self._enqueue("ocr", path)
             elif manifest["video_upload"]["status"] in ("pending", "retry") or manifest["text_upload"]["status"] in ("pending", "retry"): self._enqueue("upload", path)
             elif manifest["config"]["upload"].get("delete_after_success") and Path(manifest["video_path"]).exists(): self._enqueue("upload", path)
@@ -913,10 +913,10 @@ class Runtime:
                 now = time.time()
                 for manifest in self.manifests.iter_all():
                     path = self.manifests.path(manifest["event_id"], manifest["camera_id"])
-                    if manifest["recording"]["status"] in ("waiting", "pending") and manifest["coverage"]["requested_end"] < now:
-                        self._enqueue("stitch", path)
-                    if any(manifest[key]["status"] == "retry" and manifest[key]["next_retry"] <= now for key in ("text_upload", "video_upload")):
-                        self._enqueue("upload", path)
+                    recording = manifest["recording"]["status"]
+                    if recording in ("waiting", "pending") and manifest["coverage"]["requested_end"] < now: self._enqueue("stitch", path)
+                    elif recording == "complete" and manifest["ocr"]["status"] == "pending": self._enqueue("ocr", path)
+                    elif recording == "complete" and manifest["ocr"]["status"] != "pending" and any(manifest[key]["status"] == "pending" or manifest[key]["status"] == "retry" and manifest[key]["next_retry"] <= now for key in ("text_upload", "video_upload")): self._enqueue("upload", path)
                     if manifest["config"]["upload"].get("delete_after_success") and Path(manifest["video_path"]).exists() and manifest.get("cleanup_next_retry", 0) <= now and manifest["text_upload"]["status"] == manifest["video_upload"]["status"] == "complete": self._enqueue("upload", path)
             except Exception as exc: self.add_error(f"维护任务失败: {exc}")
     def _set_disk_state(self, enough: bool) -> None:
@@ -1009,10 +1009,9 @@ class Runtime:
             valid = [item for item in found["streams"] if item.get("validated")]
             if not valid: raise AppError("设备没有验证通过的 RTSP 主码流", "NO_VALID_STREAM", 409)
             stream = max(valid, key=lambda item: int(item.get("width") or 0) * int(item.get("height") or 0)); main_url = authenticated_url(stream["url"], username, password); preview_url = main_url
-        for value in (main_url, preview_url):
-            parsed = urlparse(value)
-            if parsed.scheme.lower() != "rtsp" or not parsed.hostname:
-                raise AppError("RTSP 地址无效", "INVALID_CAMERA", 422)
+        try:
+            if not all(valid_rtsp(value) for value in (main_url, preview_url)): raise ValueError
+        except ValueError as exc: raise AppError("RTSP 地址无效", "INVALID_CAMERA", 422) from exc
         config = self.config_store.get()
         if not camera_id:
             base = ("cam_" + re.sub(r"[^A-Za-z0-9_-]", "_", urlparse(main_url).hostname or ""))[:40]
@@ -1034,8 +1033,9 @@ class Runtime:
         with self.serial_lock: serials = copy.deepcopy(self.serial_status)
         return {"accepting_events": self.accepting_events, "disk": {"total": usage.total, "free": usage.free, "used": usage.used}, "recorders": {key: value.status for key, value in self.recorders.items()}, "forwarders": {key: value.status for key, value in self.forwarders.items()}, "previews": {key: {"mode": value.mode, "viewers": value.viewers} for key, value in self.previews.items()}, "serials": serials, "queues": {key: item.qsize() for key, item in self.queues.items()}, "errors": self.status_errors[-20:]}
     def shutdown(self) -> None:
-        logger.info("服务正在退出"); self.accepting_events = False
-        self.stop.set()
+        logger.info("服务正在退出"); self.accepting_events = False; self.stop.set()
+        with self.delay_condition: self.delay_condition.notify_all()
+        if getattr(self, "delay_thread", None): self.delay_thread.join(timeout=2)
         for item in (*self.recorders.values(), *self.previews.values(), *self.forwarders.values()): item.close()
         self.ocr_client.close()
 def sha256_file(path: Path) -> str:
@@ -1175,9 +1175,9 @@ def tray_thread() -> None:
         image = Image.new("RGB", (64, 64), "#0b1220"); draw = ImageDraw.Draw(image)
         draw.ellipse((10, 10, 54, 54), fill="#1fb6ff"); draw.rectangle((27, 20, 37, 44), fill="white")
         def open_web(icon=None, item=None): webbrowser.open(f"http://127.0.0.1:{runtime.bound_http['port']}")
-        def toggle(icon=None, item=None): set_autostart(not autostart_enabled())
+        def toggle(icon=None, item=None): enabled = not autostart_enabled(); set_autostart(enabled); icon.update_menu(); icon.notify(f"开机自启已{'开启' if enabled else '关闭'}", "事件录像系统")
         def exit_app(icon=None, item=None): runtime.shutdown(); icon.stop(); os._exit(0)
-        icon = pystray.Icon(APP_NAME, image, "事件录像系统", pystray.Menu(pystray.MenuItem("打开网页", open_web), pystray.MenuItem("设置/取消开机自启", toggle), pystray.MenuItem("退出程序", exit_app)))
+        icon = pystray.Icon(APP_NAME, image, "事件录像系统", pystray.Menu(pystray.MenuItem("打开网页", open_web), pystray.MenuItem(lambda _: "开机自启：已开启" if autostart_enabled() else "开机自启：未开启", toggle, checked=lambda _: autostart_enabled()), pystray.MenuItem("退出程序", exit_app)))
         icon.run()
     except Exception as exc: runtime.add_error(f"托盘启动失败: {exc}")
 def autostart_enabled() -> bool:
