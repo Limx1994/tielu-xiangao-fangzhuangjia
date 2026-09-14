@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import queue
 import threading
@@ -8,6 +9,10 @@ import stream_forwarder
 
 os.environ.setdefault("XGFZJ_TESTING", "1")
 import app as recorder
+
+
+def test_testing_uses_null_log_handler():
+    assert isinstance(recorder.handler, logging.NullHandler)
 
 
 @pytest.fixture()
@@ -61,7 +66,7 @@ def test_page_exposes_all_config_settings(client):
     assert 'id="camera-preview" type="password"' not in page
 
 
-def test_config_validation_rejects_bad_values():
+def test_config_rejects_bad_values():
     value = recorder.deep_merge(recorder.DEFAULT_CONFIG, {"recording": {"segment_seconds": 1}})
     with pytest.raises(recorder.AppError) as error:
         recorder.validate_config(value)
@@ -84,14 +89,14 @@ def test_config_validation_rejects_bad_values():
     {"id": "cam", "rtsp_url": "rtsp://192.0.2.1/main", "preview_url": "http://192.0.2.1/sub"},
     {"id": "cam", "rtsp_url": "rtsp://192.0.2.1/main", "preview_url": "rtsp://192.0.2.1:0/sub"},
 ])
-def test_config_validation_rejects_invalid_rtsp_addresses(camera):
+def test_config_rejects_invalid_rtsp(camera):
     value = recorder.deep_merge(recorder.DEFAULT_CONFIG, {"cameras": [camera]})
     with pytest.raises(recorder.AppError) as error:
         recorder.validate_config(value)
     assert error.value.code == "INVALID_CONFIG"
 
 
-def test_config_validation_accepts_all_group_boundaries():
+def test_config_accepts_group_bounds():
     value = recorder.deep_merge(recorder.DEFAULT_CONFIG, {
         "http": {"host": "localhost", "port": 65535},
         "recording": {"pre_seconds": 3600, "post_seconds": 600, "segment_seconds": 60},
@@ -120,7 +125,7 @@ def test_config_validation_accepts_all_group_boundaries():
     {"storage": {"reserve_bytes": -1}},
     {"storage": {"cache_keep_seconds": 29}},
 ])
-def test_config_validation_rejects_all_group_ranges(update):
+def test_config_rejects_group_ranges(update):
     with pytest.raises(recorder.AppError) as error:
         recorder.validate_config(recorder.deep_merge(recorder.DEFAULT_CONFIG, update))
     assert error.value.code == "INVALID_CONFIG"
@@ -165,7 +170,7 @@ def test_serial_probe_protocol_and_config():
     with pytest.raises(recorder.AppError): recorder.validate_config(value)
 
 
-def test_device_ids_and_serial_limit_are_enforced():
+def test_device_ids_and_serial_limit():
     camera = {"id": "same", "rtsp_url": "rtsp://192.0.2.1/main"}
     value = recorder.deep_merge(recorder.DEFAULT_CONFIG, {"cameras": [camera, dict(camera)]})
     with pytest.raises(recorder.AppError, match="ID 无效或重复"):
@@ -181,7 +186,7 @@ def test_device_ids_and_serial_limit_are_enforced():
         recorder.validate_config(value)
 
 
-def test_serial_rebinds_when_com_number_changes(monkeypatch):
+def test_serial_rebinds_after_port_change(monkeypatch, caplog):
     class Stop:
         waits = 0
         def is_set(self): return self.waits >= 2
@@ -197,7 +202,7 @@ def test_serial_rebinds_when_com_number_changes(monkeypatch):
         def reset_input_buffer(self): pass
         def write(self, _): pass
         def flush(self): pass
-        def close(self): pass
+        def close(self): raise OSError("close failed")
         def read(self, _):
             if self.chunks: return self.chunks.pop(0)
             raise OSError("removed")
@@ -213,6 +218,27 @@ def test_serial_rebinds_when_com_number_changes(monkeypatch):
     assert opened == ["COM7", "COM19"]
     assert triggered == ["serial:trigger_1", "serial:trigger_1"]
     assert runtime.serial_claims == {} and len(errors) == 2
+    assert caplog.text.count("关闭失败") == 2
+
+
+def test_serial_probe_errors_are_reported(monkeypatch):
+    class Stop:
+        waits = 0
+        def is_set(self): return self.waits >= 1
+        def wait(self, _): self.waits += 1
+    class Port:
+        device = "COM7"
+    def fail_open(*_args, **_kwargs):
+        raise OSError("access denied")
+    monkeypatch.setattr(recorder, "list_ports", type("Ports", (), {"comports": staticmethod(lambda: [Port()])}))
+    monkeypatch.setattr(recorder, "serial", type("SerialModule", (), {"Serial": fail_open}))
+    runtime = recorder.Runtime.__new__(recorder.Runtime)
+    runtime.stop, runtime.serial_generation = Stop(), 1
+    runtime.serial_lock, runtime.serial_scan_lock = threading.Lock(), threading.Lock()
+    runtime.serial_claims = {}; runtime.serial_status = {"trigger_1": {}}
+    runtime._serial_loop({"device_id": "trigger_1", "baudrate": 9600, "mode": "text", "trigger": "OPEN"}, 1)
+    assert "COM7" in runtime.serial_status["trigger_1"]["error"]
+    assert "access denied" in runtime.serial_status["trigger_1"]["error"]
 
 
 def test_normalize_plate():
@@ -275,7 +301,7 @@ def test_manifest_iteration_is_limited(tmp_path, monkeypatch):
     assert [item["event_id"] for item in store.iter_all(2)] == ["2", "1"]
 
 
-def test_manifest_index_keeps_all_active_and_only_200_recent(tmp_path):
+def test_index_keeps_active_and_200_recent(tmp_path):
     store = recorder.ManifestStore(tmp_path, recorder.atomic_json, recorder.logger, recorder.utc_now)
     base_time = 1_700_000_000_000_000_000
     for index in range(205):
@@ -305,7 +331,7 @@ def test_manifest_index_keeps_all_active_and_only_200_recent(tmp_path):
 
 
 @pytest.mark.parametrize("old_active,new_active", [(False, True), (True, False)])
-def test_manifest_index_crash_order_is_recoverable(tmp_path, old_active, new_active):
+def test_index_crash_order_recoverable(tmp_path, old_active, new_active):
     def value(active):
         return {"event_id": "evt", "camera_id": "cam", "video_path": str(tmp_path / "missing.mp4"),
                 "recording": {"status": "waiting" if active else "complete"}, "ocr": {"status": "complete"},
@@ -325,7 +351,7 @@ def test_manifest_index_crash_order_is_recoverable(tmp_path, old_active, new_act
     assert bool(list(recovered.iter_all())) is durable
 
 
-def test_recording_failure_terminates_downstream_and_active_index(tmp_path):
+def test_recording_failure_stops_pipeline(tmp_path):
     store = recorder.ManifestStore(tmp_path, recorder.atomic_json, recorder.logger, recorder.utc_now)
     manifest = store.create("evt", {"id": "cam"}, 1, recorder.deep_merge(recorder.DEFAULT_CONFIG, {}))
     manifest["protected_segments"] = [str(tmp_path / "segment.ts")]
@@ -358,7 +384,7 @@ def test_camera_credentials_use_config():
     assert recorder.camera_url(value["cameras"][0], "rtsp_url") == "rtsp://user:pass@127.0.0.1/live"
 
 
-def test_config_secrets_visibility_and_preservation(tmp_path):
+def test_config_secret_visibility(tmp_path):
     store = recorder.ConfigStore.__new__(recorder.ConfigStore)
     store.path, store.lock = tmp_path / "config.json", threading.RLock()
     store.data = recorder.deep_merge(recorder.DEFAULT_CONFIG, {"upload": {"token": "secret"}, "cameras": [{"id": "cam1", "rtsp_url": "rtsp://user:pass@127.0.0.1/live"}]})
@@ -374,7 +400,7 @@ def test_config_secrets_visibility_and_preservation(tmp_path):
     assert json.loads(store.path.read_text(encoding="utf-8"))["upload"]["token"] == ""
 
 
-def test_config_store_preserves_extensions_and_rejects_invalid_write(tmp_path):
+def test_config_extensions_invalid_write(tmp_path):
     store = recorder.ConfigStore.__new__(recorder.ConfigStore)
     store.path, store.lock = tmp_path / "config.json", threading.RLock()
     store.data = recorder.deep_merge(recorder.DEFAULT_CONFIG, {})
@@ -402,7 +428,7 @@ def test_config_store_removes_legacy_ocr_fps(tmp_path, monkeypatch):
     assert "fps" not in store.save(incoming)["ocr"]
 
 
-def test_http_change_is_reported_as_restart_required():
+def test_http_change_requires_restart():
     old = recorder.deep_merge(recorder.DEFAULT_CONFIG, {})
     saved = recorder.deep_merge(old, {"http": {"port": 5001}})
     class Store:
@@ -459,14 +485,14 @@ def test_upload_body_enforces_total_timeout():
     with pytest.raises(recorder.requests.Timeout): body.read(1)
 
 
-def test_upload_addresses_accept_url_or_bare_host():
+def test_upload_accepts_url_or_bare_host():
     assert recorder.normalize_http_endpoint("192.168.1.20") == "http://192.168.1.20"
     assert recorder.normalize_http_endpoint("192.168.1.20:8080/report") == "http://192.168.1.20:8080/report"
     assert recorder.normalize_http_endpoint("https://example.com/upload") == "https://example.com/upload"
     with pytest.raises(ValueError): recorder.normalize_http_endpoint("192.168.1.999/report")
 
 
-def test_forward_target_accepts_udp_url_or_ip():
+def test_forward_accepts_udp_or_ip():
     assert recorder.normalize_udp_target("192.168.2.20") == "udp://192.168.2.20:5000"
     assert recorder.normalize_udp_target("192.168.2.20:5001") == "udp://192.168.2.20:5001"
     assert recorder.normalize_udp_target("udp://receiver.local:6000") == "udp://receiver.local:6000"
@@ -484,7 +510,7 @@ def test_forward_targets_must_be_unique():
         recorder.validate_config(value)
 
 
-def test_forwarder_uses_stream_copy_and_mpegts():
+def test_forwarder_stream_copy_mpegts():
     camera = {"id": "cam", "rtsp_url": "rtsp://user:pass@192.0.2.1/main", "forward_url": "udp://192.168.2.20:5000"}
     command = recorder.StreamForwarder(camera, recorder.FFMPEG, threading.Event(), {})._command()
     assert command[command.index("-c:v") + 1] == "copy"
@@ -492,7 +518,7 @@ def test_forwarder_uses_stream_copy_and_mpegts():
     assert command[-1] == "udp://192.168.2.20:5000?pkt_size=1316"
 
 
-def test_forwarder_bounds_stderr_and_close_stops_thread(monkeypatch):
+def test_forwarder_bounds_and_stops(monkeypatch):
     created, limits = threading.Event(), []
     original_deque = stream_forwarder.deque
 
@@ -524,7 +550,7 @@ def test_forwarder_bounds_stderr_and_close_stops_thread(monkeypatch):
     assert forwarder.status["state"] == "stopped"
 
 
-def test_config_store_normalizes_bare_upload_addresses(tmp_path):
+def test_config_normalizes_upload_hosts(tmp_path):
     store = recorder.ConfigStore.__new__(recorder.ConfigStore)
     store.path, store.lock = tmp_path / "config.json", threading.RLock()
     store.data = recorder.deep_merge(recorder.DEFAULT_CONFIG, {})
@@ -533,7 +559,7 @@ def test_config_store_normalizes_bare_upload_addresses(tmp_path):
     assert saved["upload"]["video_url"] == "http://192.168.1.21:8080/video"
 
 
-def test_config_store_normalizes_forward_target(tmp_path):
+def test_config_normalizes_forward_target(tmp_path):
     store = recorder.ConfigStore.__new__(recorder.ConfigStore)
     store.path, store.lock = tmp_path / "config.json", threading.RLock()
     store.data = recorder.deep_merge(recorder.DEFAULT_CONFIG, {})
@@ -542,7 +568,7 @@ def test_config_store_normalizes_forward_target(tmp_path):
     assert saved["cameras"][0]["forward_url"] == "udp://192.168.2.20:5001"
 
 
-def test_network_clients_ignore_proxy_environment(monkeypatch):
+def test_network_clients_ignore_proxy(monkeypatch):
     for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
         monkeypatch.setenv(name, "http://127.0.0.1:1")
     environment = recorder.process_args()["env"]
@@ -552,7 +578,7 @@ def test_network_clients_ignore_proxy_environment(monkeypatch):
         assert session.trust_env is False and session.proxies == {}
 
 
-def test_scan_credentials_are_encoded_and_scrubbed():
+def test_scan_credentials_safe():
     value = recorder.authenticated_url("rtsp://192.0.2.1/live", "admin user", "p@ss")
     assert value == "rtsp://admin%20user:p%40ss@192.0.2.1/live"
     assert recorder.scrub_message(value) == "rtsp://***@192.0.2.1/live"
@@ -568,7 +594,7 @@ def test_rtsp_commands_use_supported_timeout():
     assert all("nobuffer" in item for _, item in previews)
 
 
-def test_scan_result_stores_credentials_in_config():
+def test_scan_saves_credentials():
     saved = {}
     runtime = recorder.Runtime.__new__(recorder.Runtime)
     runtime.scan_lock, runtime.scan_auth = threading.Lock(), ("admin", "secret")
@@ -586,7 +612,7 @@ def test_scan_result_stores_credentials_in_config():
     assert saved["cameras"][0]["forward_url"] == "udp://192.168.2.20:5000"
 
 
-def test_manual_camera_generates_id_and_main_preview():
+def test_manual_camera_default_id_preview():
     saved = {}
     runtime = recorder.Runtime.__new__(recorder.Runtime)
     runtime.config_store = type("Store", (), {"get": lambda self: {"cameras": []}})()
@@ -596,7 +622,7 @@ def test_manual_camera_generates_id_and_main_preview():
     assert saved["cameras"][0]["forward_url"] == "udp://192.168.2.20:5000"
 
 
-def test_manual_camera_accepts_custom_id_and_preview():
+def test_manual_camera_custom_id_preview():
     saved = {}
     runtime = recorder.Runtime.__new__(recorder.Runtime)
     runtime.config_store = type("Store", (), {"get": lambda self: {"cameras": []}})()
@@ -606,7 +632,7 @@ def test_manual_camera_accepts_custom_id_and_preview():
     assert camera["id"] == "gate_1" and saved["cameras"][0]["preview_url"] == "rtsp://192.0.2.8/sub"
 
 
-def test_manual_camera_rejects_invalid_forward_target():
+def test_manual_camera_rejects_forward():
     runtime = recorder.Runtime.__new__(recorder.Runtime)
     runtime.config_store = type("Store", (), {"get": lambda self: {"cameras": []}})()
     with pytest.raises(recorder.AppError) as error:
@@ -614,7 +640,7 @@ def test_manual_camera_rejects_invalid_forward_target():
     assert error.value.status == 422 and error.value.code == "INVALID_CAMERA"
 
 
-def test_manual_camera_ids_distinguish_streams():
+def test_manual_camera_ids_by_stream():
     state = {"cameras": []}
     runtime = recorder.Runtime.__new__(recorder.Runtime)
     runtime.config_store = type("Store", (), {"get": lambda self: {"cameras": list(state["cameras"])}})()
@@ -652,7 +678,7 @@ def test_remove_camera_rejects_pending_event():
     {"enabled": False},
     {"rtsp_url": "rtsp://192.0.2.2/main"},
 ])
-def test_pending_event_rejects_camera_disable_or_stream_change(camera_update):
+def test_pending_event_blocks_camera_change(camera_update):
     camera = {"id": "cam1", "enabled": True, "rtsp_url": "rtsp://192.0.2.1/main"}
     runtime = recorder.Runtime.__new__(recorder.Runtime)
     runtime.config_lock = threading.RLock()
@@ -669,7 +695,7 @@ def test_pending_event_rejects_camera_disable_or_stream_change(camera_update):
     assert error.value.code == "CAMERA_BUSY"
 
 
-def test_preview_close_terminates_existing_subscriber():
+def test_preview_close_stops_subscriber():
     class ExistingThread:
         @staticmethod
         def is_alive(): return True
@@ -685,6 +711,33 @@ def test_preview_close_terminates_existing_subscriber():
     assert preview.viewers == 0
 
 
+def test_preview_rejects_large_buffer(monkeypatch, caplog):
+    class DataPipe:
+        def __init__(self): self.sent = False
+        def read(self, _size):
+            if self.sent: return b""
+            self.sent = True; return b"123456789"
+    class ErrorPipe:
+        @staticmethod
+        def readline(): return b""
+    class Process:
+        def __init__(self, preview): self.preview, self.stdout, self.stderr, self.done = preview, DataPipe(), ErrorPipe(), False
+        def poll(self): return 0 if self.done else None
+        def terminate(self): self.done = True; self.preview.viewers = 0
+        def wait(self, timeout=None): return 0
+        def kill(self): self.done = True
+    preview = recorder.Preview({"id": "cam", "rtsp_url": "rtsp://192.0.2.1/main"}, recorder.DEFAULT_CONFIG)
+    created = []
+    def create_process(*_args, **_kwargs):
+        process = Process(preview); created.append(process); return process
+    monkeypatch.setattr(recorder, "MAX_JPEG_BUFFER", 8)
+    monkeypatch.setattr(recorder.subprocess, "Popen", create_process)
+    preview.viewers = 1
+    preview._run()
+    assert len(created) == 1 and created[0].done
+    assert "预览帧缓冲超出上限" in caplog.text
+
+
 def test_ocr_stop_prevents_new_process(monkeypatch):
     stop = threading.Event(); stop.set()
     client = recorder.OCRClient(recorder.DEFAULT_CONFIG, stop)
@@ -694,7 +747,7 @@ def test_ocr_stop_prevents_new_process(monkeypatch):
     assert error.value.code == "SHUTTING_DOWN"
 
 
-def test_ocr_cpu_threads_change_restarts_process(tmp_path, monkeypatch):
+def test_ocr_threads_restart_process(tmp_path, monkeypatch):
     ocr_dir, log_dir = tmp_path / "ocr", tmp_path / "logs"
     (ocr_dir / "models").mkdir(parents=True); log_dir.mkdir()
     (ocr_dir / "ppocr_worker.exe").write_bytes(b"x" * 100_001)
@@ -738,7 +791,7 @@ def test_remove_camera_api(client, monkeypatch):
     assert removed == ["cam_1"]
 
 
-def test_segment_protection_is_reference_counted(tmp_path):
+def test_segment_protection_ref_counted(tmp_path):
     runtime = recorder.Runtime.__new__(recorder.Runtime)
     runtime.protected, runtime.protected_lock = {}, threading.Lock()
     segment = tmp_path / "shared.ts"
@@ -760,7 +813,7 @@ def test_full_queue_reports_and_releases_key(tmp_path):
     assert "队列已满" in runtime.status_errors[-1]["message"]
 
 
-def test_upload_stream_and_valid_receipts_delete_file(tmp_path, monkeypatch):
+def test_upload_stream_receipt_deletes_file(tmp_path, monkeypatch):
     video = tmp_path / "event.mp4"; video.write_bytes(b"video" * 200_000)
     upload = recorder.deep_merge(recorder.DEFAULT_CONFIG["upload"], {"delete_after_success": True, "text_url": "http://local/text", "video_url": "http://local/video"})
     manifest = {"event_id": "evt", "camera_id": "cam", "trigger_time": 1, "coverage": {}, "ocr": {},
@@ -792,7 +845,7 @@ def test_upload_stream_and_valid_receipts_delete_file(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("video_url", ["", "http://local/video"])
-def test_text_upload_succeeds_without_video_endpoint_or_file(tmp_path, monkeypatch, video_url):
+def test_text_upload_without_video(tmp_path, monkeypatch, video_url):
     upload = recorder.deep_merge(recorder.DEFAULT_CONFIG["upload"], {
         "text_url": "http://local/text", "video_url": video_url,
     })
@@ -824,7 +877,7 @@ def test_text_upload_succeeds_without_video_endpoint_or_file(tmp_path, monkeypat
     assert manifest["video_upload"]["status"] == "attention"
 
 
-def test_video_upload_reuses_cached_file_identity(tmp_path, monkeypatch):
+def test_video_upload_reuses_identity(tmp_path, monkeypatch):
     video = tmp_path / "event.mp4"; video.write_bytes(b"video")
     stat = video.stat(); digest = "cached-digest"
     upload = recorder.deep_merge(recorder.DEFAULT_CONFIG["upload"], {
@@ -981,7 +1034,7 @@ def test_config_api_forwards_secret_clear(client, monkeypatch):
     assert response.status_code == 200 and seen["clear"] == ["token"]
 
 
-def test_tray_autostart_shows_state_and_feedback(monkeypatch):
+def test_tray_autostart_state_feedback(monkeypatch):
     import pystray
     state = {"enabled": False}
     captured, updates, notices = {}, [], []
@@ -1070,7 +1123,7 @@ def test_ocr_stops_and_reports_failures(tmp_path, monkeypatch, frame_batches, ex
     assert saved and runtime.queues["upload"].get_nowait() == path
 
 
-def test_old_enabled_ocr_task_closes_worker_when_current_config_disabled(tmp_path, monkeypatch):
+def test_disabled_ocr_closes_old_worker(tmp_path, monkeypatch):
     old_config = recorder.deep_merge(recorder.DEFAULT_CONFIG, {"ocr": {"enabled": True}})
     current_config = recorder.deep_merge(recorder.DEFAULT_CONFIG, {"ocr": {"enabled": False}})
     manifest = {
@@ -1103,7 +1156,7 @@ def test_old_enabled_ocr_task_closes_worker_when_current_config_disabled(tmp_pat
     assert not worker.is_alive()
 
 
-def test_disk_low_stops_and_restarts_recorders(monkeypatch):
+def test_disk_low_restarts_recorders(monkeypatch):
     class Recorder:
         def __init__(self): self.closed = False
         def close(self): self.closed = True
@@ -1114,7 +1167,7 @@ def test_disk_low_stops_and_restarts_recorders(monkeypatch):
     assert item.closed and runtime.accepting_events and restarted == [True]
 
 
-def test_manual_retry_uses_current_upload_config(tmp_path):
+def test_manual_retry_uses_current_config(tmp_path):
     path = tmp_path / "manifest.json"; path.write_text("{}")
     manifest = {"config": {"upload": {"text_url": "old"}}, "text_upload": {"status": "attention", "attempts": 8},
                 "video_upload": {"status": "complete", "attempts": 1}}
@@ -1129,7 +1182,7 @@ def test_manual_retry_uses_current_upload_config(tmp_path):
     assert manifest["text_upload"]["status"] == "pending" and manifest["text_upload"]["attempts"] == 0
 
 
-def test_active_upload_retry_is_deferred_then_requeued(tmp_path):
+def test_active_upload_retry_requeued(tmp_path):
     path = tmp_path / "evt" / "cam" / "manifest.json"
     path.parent.mkdir(parents=True); path.write_text("{}", encoding="utf-8")
     manifest = {
@@ -1158,7 +1211,7 @@ def test_active_upload_retry_is_deferred_then_requeued(tmp_path):
     assert manifest["text_upload"]["status"] == "complete"
 
 
-def test_full_upload_queue_uses_bounded_scheduler_and_restores_retry(tmp_path):
+def test_full_upload_queue_restores_retry(tmp_path):
     path = tmp_path / "evt" / "cam" / "manifest.json"; path.parent.mkdir(parents=True); path.write_text("{}")
     manifest = {"config": {"upload": {"text_url": "old"}}, "text_upload": {"status": "attention", "attempts": 1},
                 "video_upload": {"status": "complete", "attempts": 1}}
@@ -1176,7 +1229,7 @@ def test_full_upload_queue_uses_bounded_scheduler_and_restores_retry(tmp_path):
     assert runtime._enqueue("upload", path) and runtime.queues["upload"].get_nowait() == path
 
 
-def test_delayed_tasks_use_one_bounded_scheduler_and_shutdown(tmp_path):
+def test_delayed_tasks_bounded_shutdown(tmp_path):
     runtime = recorder.Runtime.__new__(recorder.Runtime); runtime.stop = threading.Event(); runtime.queue_lock = threading.RLock()
     runtime.delay_condition = threading.Condition(runtime.queue_lock); runtime.delayed, runtime.delay_seq, runtime.delay_limit = [], 0, 32
     runtime.queue_sets = {"stitch": set()}; runtime.queues = {"stitch": queue.Queue()}; runtime.status_errors = []
@@ -1191,7 +1244,7 @@ def test_delayed_tasks_use_one_bounded_scheduler_and_shutdown(tmp_path):
         runtime.delay_thread.join(2)
     assert not runtime.delay_thread.is_alive() and "threading.Timer" not in (recorder.BASE_DIR / "app.py").read_text(encoding="utf-8")
 
-def test_maintenance_reschedules_stranded_ocr_and_upload_pending(tmp_path, monkeypatch):
+def test_maintenance_reschedules_tasks(tmp_path, monkeypatch):
     paths = {name: tmp_path / name / "cam" / "manifest.json" for name in ("ocr", "upload")}
     manifests = [
         {"event_id": "ocr", "camera_id": "cam", "recording": {"status": "complete"}, "ocr": {"status": "pending"}, "text_upload": {"status": "pending"}, "video_upload": {"status": "pending"}, "config": recorder.DEFAULT_CONFIG},
@@ -1216,7 +1269,7 @@ def test_maintenance_reschedules_stranded_ocr_and_upload_pending(tmp_path, monke
     assert runtime.queues["ocr"].get_nowait() == paths["ocr"] and runtime.queues["upload"].get_nowait() == paths["upload"]
 
 
-def test_config_change_rebuilds_only_dependent_camera_task():
+def test_config_rebuilds_dependent_tasks():
     cameras = [
         {"id": "cam1", "enabled": True, "rtsp_url": "rtsp://192.0.2.1/main",
          "preview_url": "rtsp://192.0.2.1/sub", "forward_url": "udp://192.0.2.10:5000"},
@@ -1259,7 +1312,7 @@ def test_config_change_rebuilds_only_dependent_camera_task():
     assert runtime.forwarders == {"cam1": forward1, "cam2": forward2}
 
 
-def test_frontend_serializes_all_config_mutations():
+def test_frontend_serializes_mutations():
     script = (recorder.BASE_DIR / "web" / "app.js").read_text(encoding="utf-8")
     assert "let configSave=Promise.resolve()" in script
     assert "function serializeConfigSave(action)" in script
@@ -1271,7 +1324,15 @@ def test_frontend_serializes_all_config_mutations():
     assert "value.cameras.find(item=>item.id===cameraId)" in script and "配置已变化，请重试" in script; scan = script[script.index('$("scan-results").onclick'):]; assert scan.index("const items=") < scan.index("await serializeConfigSave")
 
 
-def test_build_excludes_unused_ocr_service_and_rebuilds_checksums():
+def test_fetch_pins_ffmpeg_archive():
+    script = (recorder.BASE_DIR / "scripts" / "fetch_dependencies.ps1").read_text(encoding="utf-8")
+    assert 'ffmpegVersion = "8.1.1"' in script
+    assert "6F58CE889F59C311410F7D2B18895B33C03456463486F3B1EBC93D97A0F54541" in script
+    assert "Expand-Archive" in script and "FFmpeg 压缩包 SHA-256 不匹配" in script
+    assert '$_.path -ne "dist/ppocr/README.md"' in script
+
+
+def test_build_excludes_service_checksums():
     script = (recorder.BASE_DIR / "scripts" / "build.ps1").read_text(encoding="utf-8")
     assert '$_.Name -notin @("ppocr_service.exe", "SHA256SUMS.json")' in script
     assert "$releaseFiles = @(Get-ChildItem -LiteralPath $ocrTarget -Recurse -File" in script

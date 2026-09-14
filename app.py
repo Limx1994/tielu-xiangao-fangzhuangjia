@@ -73,6 +73,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 }
 OCR_FPS = 2
 OCR_BATCH_SECONDS = 5.0
+MAX_JPEG_BUFFER = 25_000_000
 SERIAL_PROBE = b"XGFZJ:DISCOVER:1\r\n"
 class AppError(Exception):
     def __init__(self, message: str, code: str = "APP_ERROR", status: int = 400):
@@ -91,7 +92,7 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(data, ensure_ascii=False)
 logger = logging.getLogger(APP_NAME)
 logger.setLevel(logging.INFO)
-handler = RotatingFileHandler(LOG_DIR / "app.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
+handler = logging.NullHandler() if os.environ.get("XGFZJ_TESTING") == "1" else RotatingFileHandler(LOG_DIR / "app.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8")
 handler.setFormatter(JsonFormatter())
 logger.addHandler(handler)
 def utc_now() -> str:
@@ -399,6 +400,7 @@ class Preview:
                         if time.monotonic() - last_frame > 12: raise AppError("预览连续 12 秒无新画面", "PREVIEW_STALLED", 502) from None
                         continue
                     buffer.extend(chunk)
+                    if len(buffer) > MAX_JPEG_BUFFER: raise AppError("预览帧缓冲超出上限", "PREVIEW_FRAME_TOO_LARGE", 502)
                     while True:
                         start, end = buffer.find(b"\xff\xd8"), buffer.find(b"\xff\xd9")
                         if start < 0 or end < start:
@@ -493,7 +495,7 @@ def jpeg_frames(video: Path, fps: int, start: float = 0.0, duration: float | Non
             if not chunk:
                 break
             buffer.extend(chunk)
-            if len(buffer) > 25_000_000:
+            if len(buffer) > MAX_JPEG_BUFFER:
                 raise AppError("OCR 抽帧缓冲异常", "FRAME_TOO_LARGE", 500)
             while True:
                 frame_start, frame_end = buffer.find(b"\xff\xd8"), buffer.find(b"\xff\xd9")
@@ -628,6 +630,7 @@ class Runtime:
             try: ports = [item.device for item in list_ports.comports()]
             except Exception as exc: self.add_error(f"串口扫描失败: {exc}"); self.stop.wait(2); continue
             self._serial_state(device_id, generation, state="scanning", port=None, checked=len(ports))
+            last_probe_error = None
             for port in ports:
                 if self.stop.is_set() or generation != self.serial_generation: return
                 with self.serial_scan_lock:
@@ -638,10 +641,12 @@ class Runtime:
                         stream = serial.Serial(port, int(definition.get("baudrate", 9600)), timeout=0.15, write_timeout=0.5)
                         if not probe_serial(stream, device_id): stream.close(); continue
                         with self.serial_lock: self.serial_claims[port] = (device_id, generation)
-                    except Exception:
+                    except Exception as exc:
+                        last_probe_error = f"{port} 探测失败: {scrub_message(str(exc))}"[:160]
+                        self._serial_state(device_id, generation, error=last_probe_error)
                         try:
                             if stream: stream.close()
-                        except Exception: pass
+                        except Exception as close_exc: logger.warning("串口 %s 关闭失败: %s", port, close_exc)
                         continue
                 self._serial_state(device_id, generation, state="bound", port=port, error=None)
                 logger.info("串口设备 %s 已绑定 %s", device_id, port)
@@ -651,11 +656,14 @@ class Runtime:
                 finally:
                     try:
                         if stream: stream.close()
-                    except Exception: pass
+                    except Exception as exc: logger.warning("串口 %s 关闭失败: %s", port, exc)
                     with self.serial_lock:
                         if self.serial_claims.get(port) == (device_id, generation): self.serial_claims.pop(port, None)
                 break
-            else: self._serial_state(device_id, generation, error=f"尚未发现匹配设备，已检查 {len(ports)} 个串口")
+            else:
+                message = f"尚未发现匹配设备，已检查 {len(ports)} 个串口"
+                if last_probe_error: message += f"，最近错误: {last_probe_error}"
+                self._serial_state(device_id, generation, error=message)
             self.stop.wait(2)
     def _listen_serial(self, stream: Any, definition: dict[str, Any], trigger: bytes, generation: int) -> None:
         device_id = definition["device_id"]

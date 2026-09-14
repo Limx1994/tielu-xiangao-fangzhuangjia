@@ -2,13 +2,13 @@
 
 面向 Windows 10/11 x64 工控机的本地事件录像程序。串口收到指定指令后，系统无损拼接触发前后的录像切片，抽帧调用本机 PaddleOCR worker 识别车牌，并可靠上传识别结果和视频。
 
-默认参数为触发前 120 秒、触发后 20 秒、每段 10 秒。OCR 固定以 2 FPS 从触发点向前后检测。目标设备为 4 GB 内存的 NUC 类工控机，建议最多接入 2 路摄像头。
+默认参数为触发前 120 秒、触发后 20 秒、每段 10 秒。OCR 固定以 2 FPS 从触发点向前后检测。目标设备为 2 GB 内存的 Windows x64 工控机，最多接入 2 路摄像头；项目优先保证结构简单、资源有界和低运行损耗。
 
 ## 主要功能
 
 - 使用 FFmpeg Stream Copy 循环录像并拼接事件视频，避免重复编码。
 - 通过 ONVIF 搜索摄像头，也支持手动填写 RTSP 地址。
-- 自动识别串口设备身份，COM 号变化后自动重新绑定。
+- 自动识别串口设备身份，COM 号变化后自动重新绑定，并在状态页显示最近一次探测失败原因。
 - 使用常驻 `ppocr_worker.exe` 完成本地 OCR；从触发点向前后分批检测，并按中国大陆车牌格式过滤结果。
 - 文本与视频独立重试，使用幂等键和严格回执校验防止误删本地文件。
 - 使用持久化清单索引恢复未完成任务，仅缓存最近 200 条历史事件，避免事件累积后反复全量扫描。
@@ -20,6 +20,7 @@
 ## 运行要求
 
 - Windows 10/11 x64。
+- 目标内存为 2 GB；录像、拼接和转发采用 Stream Copy，OCR 默认单 worker、2 个 CPU 线程，预览按需启动。
 - 开发运行需要 Python 及 `requirements.txt` 中的依赖；当前验证环境为 Python 3.14.6。
 - 摄像头应提供可访问的 RTSP 主码流；自动发现需要摄像头支持 ONVIF。
 - 目标机需要允许程序访问摄像头、串口和上传服务器。
@@ -32,6 +33,13 @@ python app.py
 ```
 
 打开 `http://127.0.0.1:5000`。服务只允许本机访问。首次启动会创建 `config.json` 和 `runtime` 目录。
+
+提交前运行质量检查：
+
+```powershell
+python -m ruff check --no-cache app.py manifest_store.py network_utils.py stream_forwarder.py tests
+python -m pytest -q
+```
 
 网页使用顺序：
 
@@ -133,6 +141,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1
 
 发布目录为 `dist\XgfzjRecorder`，整体复制到目标机即可运行，不需要安装 Python。构建流程会执行：
 
+- Ruff 静态检查。
 - Python 单元测试。
 - FFmpeg H.264/H.265 切片拼接验证。
 - PyInstaller 打包。
@@ -140,9 +149,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1
 
 构建先在 `dist` 下的临时 staging 目录完成打包和验证，通过后再原子替换 `dist\XgfzjRecorder`；切换失败会恢复旧 release。构建会复制根目录 `README.md` 和所需工具运行时，从 OCR 发布内容中移除未使用的 `ppocr_service.exe`，并针对实际发布文件重新生成和逐项验证 `SHA256SUMS.json`。若旧发布目录已有 `config.json`，脚本会保留该配置；构建完成后仍应检查发布目录中没有测试日志和不应交付的敏感配置。
 
-依赖脚本固定 OCR 上游 commit，生成 SHA-256 清单，并拒绝仍为 Git LFS 指针的必要文件。脚本还会验证并修补上游 worker 的默认 `OCR.yaml` 路径，结果写入 `tools\ocr\WORKER_PATCH.json`。
+依赖脚本固定 OCR 上游 commit，并固定下载 FFmpeg 8.1.1 essentials build；两者都会验证 SHA-256。脚本拒绝仍为 Git LFS 指针的必要文件，并验证、修补上游 worker 的默认 `OCR.yaml` 路径，结果写入 `tools\ocr\WORKER_PATCH.json`。
 
-release 成功标准：构建命令退出码为 0，`dist\XgfzjRecorder\XgfzjRecorder.exe` 可通过就绪、首页和单实例检查，FFmpeg H.264/H.265 验证通过，且 OCR 发布清单中的文件数量和 SHA-256 均一致。任一检查失败都不得交付新目录。
+release 成功标准：构建命令退出码为 0，Ruff 和单元测试通过，`dist\XgfzjRecorder\XgfzjRecorder.exe` 可通过就绪、首页和单实例检查，FFmpeg H.264/H.265 验证通过，且 OCR 发布清单中的文件数量和 SHA-256 均一致。任一检查失败都不得交付新目录。
 
 ## 日志与排错
 
@@ -159,6 +168,7 @@ release 成功标准：构建命令退出码为 0，`dist\XgfzjRecorder\XgfzjRec
 - 视频上传采用流式读取，并限制连接、无进展及总时长。
 - 重叠事件可共享受引用计数保护的切片；编码参数不同的切片会拒绝拼接。
 - 网页 MJPEG 预览需要解码和 JPEG 编码，同一时间只预览当前选中的一路。
+- 预览和 OCR 抽帧的单帧缓冲上限为 25 MB；异常码流超过上限时会终止对应 FFmpeg 进程并记录明确错误。
 - OCR 在事件视频拼接后离线执行，以 5 秒为一个有界批次，固定按 2 FPS 抽取配置的全部触发前录像及触发后至视频结束的画面。每批按距触发点由近到远检测，等距时优先触发后的帧；首次识别到合格车牌即停止。默认 120 秒触发前、20 秒触发后且始终无合格车牌时，最多约执行 280 次 OCR；增加录像时长会相应增加最坏耗时。
 - 当前固定上游版本的 `ppocr_service.exe` 与 `ppocr_worker.exe` 参数协议不同，且不接受上游 README 所述的 `--fast_detect` 参数。本项目直接管理 worker 的 stdin/stdout 协议。
-- 实机吞吐、预览延迟和车牌准确率必须使用目标硬件与真实样本验收。
+- 2 GB 是目标运行约束，不代表仅凭静态检查已经验证双路全功能峰值；实机内存峰值、吞吐、预览延迟、长时间稳定性和车牌准确率必须使用目标硬件与真实样本验收。

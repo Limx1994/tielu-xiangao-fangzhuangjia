@@ -4,6 +4,8 @@ $python = (Get-Command python.exe -CommandType Application -ErrorAction Stop | S
 Set-Location $projectRoot
 if (-not (Test-Path "tools\ffmpeg\bin\ffmpeg.exe")) { throw "缺少 FFmpeg，请先运行 scripts\fetch_dependencies.ps1" }
 if (-not (Test-Path "tools\ocr\ppocr_worker.exe")) { throw "缺少 OCR，请先运行 scripts\fetch_dependencies.ps1" }
+& $python -m ruff check --no-cache app.py manifest_store.py network_utils.py stream_forwarder.py tests
+if ($LASTEXITCODE -ne 0) { throw "Ruff 检查失败，停止打包" }
 & $python -m pytest -q
 if ($LASTEXITCODE -ne 0) { throw "测试失败，停止打包" }
 $shellExe = (Get-Process -Id $PID).Path

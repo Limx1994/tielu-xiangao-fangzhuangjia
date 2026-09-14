@@ -5,18 +5,29 @@
 )
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ffmpegVersion = "8.1.1"
+$ffmpegArchiveHash = "6F58CE889F59C311410F7D2B18895B33C03456463486F3B1EBC93D97A0F54541"
+$ffmpegArchiveUrl = "https://github.com/GyanD/codexffmpeg/releases/download/$ffmpegVersion/ffmpeg-$ffmpegVersion-essentials_build.zip"
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $toolRoot = Join-Path $projectRoot "tools"
 New-Item -ItemType Directory -Force -Path $toolRoot | Out-Null
 
 function Get-GithubJson([string]$Uri) {
+    $lastError = $null
     for ($attempt = 1; $attempt -le 6; $attempt++) {
         try { return Invoke-RestMethod -Uri $Uri -Headers @{ "User-Agent" = "XgfzjBuilder" } -TimeoutSec 60 }
         catch {
-            if ($attempt -eq 6) { throw }
+            $lastError = $_.Exception
+            if ($attempt -eq 6) { break }
             Start-Sleep -Seconds ([Math]::Min(2 * $attempt, 10))
         }
     }
+    $curl = (Get-Command curl.exe -ErrorAction SilentlyContinue).Source
+    if (-not $curl) { throw $lastError }
+    $json = & $curl -L --http1.1 --fail --retry 3 --connect-timeout 30 --max-time 180 --silent --show-error -H "User-Agent: XgfzjBuilder" $Uri
+    if ($LASTEXITCODE -ne 0) { throw "GitHub JSON 请求失败: $Uri" }
+    try { return ($json | Out-String | ConvertFrom-Json) }
+    catch { throw "GitHub JSON 响应无效: $Uri；$($_.Exception.Message)" }
 }
 
 function Save-GithubFile([string]$Uri, [string]$Destination) {
@@ -66,6 +77,7 @@ if (-not $gitReady) {
     $treeUri = "https://api.github.com/repos/Limx1994/PaddleOCR-MinGW-LMX/git/trees/$OcrCommit`?recursive=1"
     $files = (Get-GithubJson $treeUri).tree | Where-Object {
         $_.type -eq "blob" -and $_.path.StartsWith("dist/ppocr/") -and
+        $_.path -ne "dist/ppocr/README.md" -and $_.path -ne "dist/ppocr/.json" -and
         $_.path -notmatch '/(test_images|output)/' -and
         $_.path -notmatch '(^|/)(ppocr\.exe|ppocr_client\.exe|ppocr_service\.exe|stress_test\.py|test\.jpg|stdout\.txt|stderr\.txt)$'
     }
@@ -189,13 +201,41 @@ Get-ChildItem -Path $ocrTarget -Recurse -File | Where-Object { $_.Name -ne "SHA2
 if (-not $SkipFfmpeg) {
     $ffmpegRoot = Join-Path $toolRoot "ffmpeg"
     $ffmpegBin = Join-Path $ffmpegRoot "bin"
-    New-Item -ItemType Directory -Force -Path $ffmpegBin | Out-Null
-    foreach ($name in @("ffmpeg.exe", "ffprobe.exe")) {
-        $source = (Get-Command $name -ErrorAction Stop).Source
-        $candidates = @($source, (Join-Path "C:\ProgramData\chocolatey\lib\ffmpeg\tools\ffmpeg\bin" $name))
-        $actual = $candidates | Where-Object { (Test-Path $_) -and (Get-Item $_).Length -gt 5000000 } | Select-Object -First 1
-        if (-not $actual) { throw "$name 不是可独立复制的静态程序，请安装 FFmpeg essentials static build" }
-        Copy-Item -LiteralPath $actual -Destination (Join-Path $ffmpegBin $name) -Force
+    $token = [guid]::NewGuid().ToString("N")
+    $ffmpegArchive = Join-Path $env:TEMP ("xgfzj-ffmpeg-" + $token + ".zip")
+    $ffmpegExtract = Join-Path $env:TEMP ("xgfzj-ffmpeg-" + $token)
+    try {
+        Save-GithubFile $ffmpegArchiveUrl $ffmpegArchive
+        $actualHash = (Get-FileHash -LiteralPath $ffmpegArchive -Algorithm SHA256).Hash
+        if ($actualHash -ne $ffmpegArchiveHash) { throw "FFmpeg 压缩包 SHA-256 不匹配: $actualHash" }
+        Expand-Archive -LiteralPath $ffmpegArchive -DestinationPath $ffmpegExtract
+        $ffmpegSource = Get-ChildItem -LiteralPath $ffmpegExtract -Filter "ffmpeg.exe" -File -Recurse | Select-Object -First 1
+        if (-not $ffmpegSource) { throw "FFmpeg 压缩包缺少 ffmpeg.exe" }
+        $sourceBin = Split-Path -Parent $ffmpegSource.FullName
+        if (-not (Test-Path -LiteralPath (Join-Path $sourceBin "ffprobe.exe"))) { throw "FFmpeg 压缩包缺少 ffprobe.exe" }
+        New-Item -ItemType Directory -Force -Path $ffmpegBin | Out-Null
+        foreach ($name in @("ffmpeg.exe", "ffprobe.exe")) {
+            $source = Join-Path $sourceBin $name
+            if ((Get-Item -LiteralPath $source).Length -lt 5000000) { throw "FFmpeg 文件异常: $name" }
+            Copy-Item -LiteralPath $source -Destination (Join-Path $ffmpegBin $name) -Force
+        }
+        $versionLine = (& (Join-Path $ffmpegBin "ffmpeg.exe") -version | Select-Object -First 1)
+        if ($LASTEXITCODE -ne 0 -or $versionLine -notmatch "^ffmpeg version $([regex]::Escape($ffmpegVersion))-essentials_build-www\.gyan\.dev") { throw "FFmpeg 版本验证失败: $versionLine" }
+        @{
+            version = $ffmpegVersion
+            archive_url = $ffmpegArchiveUrl
+            archive_sha256 = $ffmpegArchiveHash
+            ffmpeg_sha256 = (Get-FileHash -LiteralPath (Join-Path $ffmpegBin "ffmpeg.exe") -Algorithm SHA256).Hash
+            ffprobe_sha256 = (Get-FileHash -LiteralPath (Join-Path $ffmpegBin "ffprobe.exe") -Algorithm SHA256).Hash
+        } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ffmpegRoot "VERSION.json") -Encoding utf8
+    } finally {
+        Remove-Item -LiteralPath $ffmpegArchive -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $ffmpegExtract) {
+            $extractFull = [IO.Path]::GetFullPath($ffmpegExtract)
+            $tempPrefix = [IO.Path]::GetFullPath($env:TEMP).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+            if (-not $extractFull.StartsWith($tempPrefix, [StringComparison]::OrdinalIgnoreCase)) { throw "FFmpeg 临时目录越界: $extractFull" }
+            Remove-Item -LiteralPath $extractFull -Recurse -Force
+        }
     }
 }
 Write-Host "依赖准备完成。OCR commit: $OcrCommit"

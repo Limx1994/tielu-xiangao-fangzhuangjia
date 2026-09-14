@@ -52,7 +52,9 @@ tools\ocr\
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\fetch_dependencies.ps1
 ```
 
-脚本会：
+该命令同时恢复 OCR 和 FFmpeg 依赖；本节仅说明 OCR 目录的产物。FFmpeg 固定为 8.1.1 essentials build，下载压缩包会先校验 SHA-256，再提取 `ffmpeg.exe` 和 `ffprobe.exe`。
+
+OCR 获取流程会：
 
 - 获取指定 OCR 上游 commit，而不是不受控地使用最新版本。
 - 下载项目所需的 Git LFS 文件并拒绝残留的指针文件；不下载未使用的 TCP service。
