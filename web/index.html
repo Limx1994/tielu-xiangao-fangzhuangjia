@@ -9,7 +9,7 @@
 <body>
   <header>
     <div><h1>事件录像系统</h1><p id="summary">正在连接本机服务…</p></div>
-    <div class="actions"><button id="refresh" class="ghost">刷新</button></div>
+    <div class="actions"><button id="trigger-event">立即触发</button><button id="autostart" class="ghost">切换开机自启</button><button id="refresh" class="ghost">刷新</button></div>
   </header>
   <main>
     <section>
@@ -45,7 +45,6 @@
           <label>摄像头 ID（可选）<input id="camera-id" maxlength="40" pattern="[A-Za-z0-9_-]{1,40}" placeholder="留空自动生成"></label>
           <label>摄像头名称（可选）<input id="camera-name" placeholder="例如：一号门"></label>
           <label>主码流 RTSP 地址<input id="camera-main" placeholder="例如：rtsp://账号:密码@192.168.1.10/stream"></label>
-          <label>预览 RTSP 地址（可选）<input id="camera-preview" placeholder="留空使用主码流"></label>
           <label>实时转发目标（可选）<input id="camera-forward" placeholder="例如：udp://192.168.2.20:5000"></label>
         </div>
         <div class="actions"><button id="camera-add">使用此地址添加</button></div>
@@ -63,8 +62,8 @@
 
     <section>
       <div class="section-title"><h2>系统状态</h2><span id="disk" class="badge">磁盘 --</span></div>
-      <h3>串口触发设备</h3>
-      <div id="serials" class="status-grid"><div class="empty">尚未配置串口设备</div></div>
+      <h3>串口通讯</h3>
+      <div id="serials" class="status-grid"><div class="empty">正在等待自动扫描</div></div>
       <h3>摄像头录像</h3>
       <div id="recorders" class="status-grid"></div>
       <h3>实时视频转发状态</h3>
@@ -76,37 +75,13 @@
       <div class="section-title"><h2>系统配置</h2><span class="muted">每组单独验证、保存并应用</span></div>
       <div class="settings-grid">
         <div class="settings-card">
-          <h3>基础服务</h3>
-          <div class="form-grid one">
-            <label>配置版本<input id="config-version" readonly></label>
-            <label>网页监听地址<select id="http-host"><option value="127.0.0.1">127.0.0.1</option><option value="localhost">localhost</option></select></label>
-            <label>网页监听端口<input id="http-port" type="number" min="1" max="65535" step="1" required></label>
-          </div>
-          <div class="actions"><button id="save-http">保存基础服务</button><button id="autostart" class="ghost">切换开机自启</button></div>
-          <p id="http-error" class="form-error" aria-live="polite"></p>
-          <p class="muted">监听地址或端口保存后，需要重启应用才能生效。</p>
-        </div>
-
-        <div class="settings-card">
           <h3>录像</h3>
           <div class="form-grid one">
             <label>触发前录像时长（秒）<input id="recording-pre-seconds" type="number" min="0" max="3600" step="1" required></label>
             <label>触发后录像时长（秒）<input id="recording-post-seconds" type="number" min="0" max="600" step="1" required></label>
-            <label>录像切片时长（秒）<input id="recording-segment-seconds" type="number" min="2" max="60" step="1" required></label>
           </div>
           <div class="actions"><button id="save-recording">保存录像配置</button></div>
           <p id="recording-error" class="form-error" aria-live="polite"></p>
-        </div>
-
-        <div class="settings-card">
-          <h3>实时预览</h3>
-          <div class="form-grid one">
-            <label>预览宽度（像素）<input id="preview-width" type="number" min="160" max="1920" step="1" required></label>
-            <label>预览帧率（FPS）<input id="preview-fps" type="number" min="1" max="15" step="1" required></label>
-            <label>无人查看后停止时间（秒）<input id="preview-idle-seconds" type="number" min="5" max="600" step="1" required></label>
-          </div>
-          <div class="actions"><button id="save-preview">保存预览配置</button></div>
-          <p id="preview-error" class="form-error" aria-live="polite"></p>
         </div>
 
         <div class="settings-card">
@@ -131,49 +106,17 @@
             <label>最大重试次数<input id="upload-max-retries" type="number" min="1" max="100" step="1" required></label>
             <label>事件上报地址（URL 或 IP）<input id="text-url" type="password" placeholder="留空保持现值"></label>
             <label>事件视频上传地址（URL 或 IP）<input id="video-url" type="password" placeholder="留空保持现值"></label>
-            <label>Bearer Token<input id="api-token" type="password" placeholder="留空保持现值"></label>
           </div>
           <div class="secret-clear">
             <label><input id="clear-text-url" type="checkbox">清除事件上报地址</label>
             <label><input id="clear-video-url" type="checkbox">清除事件视频上传地址</label>
-            <label><input id="clear-token" type="checkbox">清除 Bearer Token</label>
           </div>
           <p id="secret-state" class="muted"></p>
           <div class="actions"><button id="save-upload">保存上传配置</button></div>
           <p id="upload-error" class="form-error" aria-live="polite"></p>
         </div>
 
-        <div class="settings-card">
-          <h3>存储</h3>
-          <div class="form-grid one">
-            <label>磁盘保留比例（%）<input id="storage-reserve-percent" type="number" min="0" max="50" step="any" required></label>
-            <label>最少保留字节数<input id="storage-reserve-bytes" type="number" min="0" step="1" required></label>
-            <label>缓存保留时间（秒）<input id="storage-cache-keep-seconds" type="number" min="30" max="86400" step="1" required></label>
-          </div>
-          <div class="actions"><button id="save-storage">保存存储配置</button></div>
-          <p id="storage-error" class="form-error" aria-live="polite"></p>
-        </div>
       </div>
-    </section>
-
-    <section>
-      <div class="section-title"><h2>串口触发配置</h2><span class="muted">最多 16 个设备</span></div>
-      <div id="serial-settings" class="device-settings"><div class="empty">尚未配置串口设备</div></div>
-      <details class="advanced-add">
-        <summary>添加串口触发设备</summary>
-        <div class="advanced-content">
-          <div class="form-grid">
-            <label>设备 ID<input id="serial-new-id" maxlength="40" pattern="[A-Za-z0-9_-]{1,40}" required></label>
-            <label>波特率<input id="serial-new-baudrate" type="number" min="300" max="4000000" step="1" value="9600" required></label>
-            <label>触发模式<select id="serial-new-mode"><option value="text">text</option><option value="hex">hex</option></select></label>
-            <label>触发指令<textarea id="serial-new-trigger" rows="3" required></textarea></label>
-          </div>
-          <label class="check-row"><input id="serial-new-enabled" type="checkbox" checked>启用此串口设备</label>
-          <p class="muted">text 模式可使用 \r、\n、\t 表示控制字符；hex 模式可使用空格、冒号或短横线分隔。</p>
-          <div class="actions"><button id="serial-add">添加串口设备</button></div>
-          <p id="serial-add-error" class="form-error" aria-live="polite"></p>
-        </div>
-      </details>
     </section>
 
     <section>

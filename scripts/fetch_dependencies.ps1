@@ -44,6 +44,47 @@ function Save-GithubFile([string]$Uri, [string]$Destination) {
     Move-Item -LiteralPath $partial -Destination $Destination -Force
 }
 
+function Get-GitBlobSha1([string]$Path) {
+    $stream = [IO.File]::OpenRead($Path)
+    $hash = [Security.Cryptography.SHA1]::Create()
+    try {
+        $prefix = [Text.Encoding]::ASCII.GetBytes("blob $($stream.Length)`0")
+        [void]$hash.TransformBlock($prefix, 0, $prefix.Length, $prefix, 0)
+        $buffer = New-Object byte[] 1048576
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            [void]$hash.TransformBlock($buffer, 0, $read, $buffer, 0)
+        }
+        [void]$hash.TransformFinalBlock([byte[]]@(), 0, 0)
+        return ([BitConverter]::ToString($hash.Hash)).Replace("-", "").ToLowerInvariant()
+    } finally {
+        $hash.Dispose(); $stream.Dispose()
+    }
+}
+
+function Get-LfsInfo([string]$Commit, [string]$RepositoryPath) {
+    $pointer = Join-Path $env:TEMP ("xgfzj-lfs-" + [guid]::NewGuid().ToString("N"))
+    try {
+        Save-GithubFile "https://raw.githubusercontent.com/Limx1994/PaddleOCR-MinGW-LMX/$Commit/$RepositoryPath" $pointer
+        $text = Get-Content -LiteralPath $pointer -Raw
+        $oid = [regex]::Match($text, '(?m)^oid sha256:([0-9a-f]{64})\r?$')
+        $size = [regex]::Match($text, '(?m)^size ([0-9]+)\r?$')
+        if (-not $oid.Success -or -not $size.Success) {
+            throw "无法读取 OCR LFS 元数据: $RepositoryPath"
+        }
+        return @{ SHA256 = $oid.Groups[1].Value; Size = [long]$size.Groups[1].Value }
+    } finally {
+        Remove-Item -LiteralPath $pointer -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Assert-OcrFile([string]$Path, [long]$ExpectedSize, [string]$ExpectedHash, [string]$HashKind) {
+    if (-not (Test-Path -LiteralPath $Path)) { throw "OCR 文件缺失: $Path" }
+    $actualSize = (Get-Item -LiteralPath $Path).Length
+    if ($actualSize -ne $ExpectedSize) { throw "OCR 文件大小不匹配: $Path，期望 $ExpectedSize，实际 $actualSize" }
+    $actualHash = if ($HashKind -eq "sha256") { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant() } else { Get-GitBlobSha1 $Path }
+    if ($actualHash -ne $ExpectedHash.ToLowerInvariant()) { throw "OCR 文件 $HashKind 不匹配: $Path，期望 $ExpectedHash，实际 $actualHash" }
+}
+
 if (-not $OcrCommit) {
     try { $OcrCommit = (git ls-remote https://github.com/Limx1994/PaddleOCR-MinGW-LMX.git refs/heads/main).Split()[0] } catch {}
     if (-not $OcrCommit) { $OcrCommit = (Get-GithubJson "https://api.github.com/repos/Limx1994/PaddleOCR-MinGW-LMX/commits/main").sha }
@@ -51,6 +92,7 @@ if (-not $OcrCommit) {
 if ($OcrCommit -notmatch '^[0-9a-f]{40}$') { throw "OCR commit 无效: $OcrCommit" }
 $checkout = Join-Path $env:TEMP ("xgfzj-ocr-" + [guid]::NewGuid().ToString("N"))
 $ocrTarget = Join-Path $toolRoot "ocr"
+$patchInfoPath = Join-Path $ocrTarget "WORKER_PATCH.json"
 New-Item -ItemType Directory -Force -Path $ocrTarget | Out-Null
 $gitReady = $false
 if ($UseGit) { try {
@@ -87,9 +129,20 @@ if (-not $gitReady) {
         $parent = Split-Path -Parent $destination
         New-Item -ItemType Directory -Force -Path $parent | Out-Null
         $isLfs = $item.size -le 200 -and $item.path -match '\.(exe|dll|pdiparams|onnx)$'
+        $lfsInfo = if ($isLfs) { Get-LfsInfo $OcrCommit $item.path } else { $null }
+        $expectedSize = if ($isLfs) { $lfsInfo.Size } else { [long]$item.size }
+        $expectedHash = if ($isLfs) { $lfsInfo.SHA256 } else { [string]$item.sha }
+        $hashKind = if ($isLfs) { "sha256" } else { "git-sha1" }
         if (Test-Path $destination) {
-            $existingSize = (Get-Item $destination).Length
-            if (($isLfs -and $existingSize -gt 200) -or (-not $isLfs -and $existingSize -eq $item.size)) { continue }
+            if ($relative -eq "ppocr_worker.exe" -and (Test-Path $patchInfoPath)) {
+                try {
+                    $patchInfo = Get-Content -LiteralPath $patchInfoPath -Raw | ConvertFrom-Json
+                    $patchedHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash
+                    if ((Get-Item -LiteralPath $destination).Length -eq $expectedSize -and $patchInfo.upstream_sha256 -eq $expectedHash -and $patchInfo.patched_sha256 -eq $patchedHash) { continue }
+                } catch { Write-Warning "OCR worker patch 缓存信息无效：$($_.Exception.Message)" }
+            }
+            try { Assert-OcrFile $destination $expectedSize $expectedHash $hashKind; continue }
+            catch { Write-Warning "OCR 缓存校验失败，重新下载 $relative：$($_.Exception.Message)" }
         }
         if ($isLfs) {
             $mediaUri = "https://media.githubusercontent.com/media/Limx1994/PaddleOCR-MinGW-LMX/$OcrCommit/$($item.path)"
@@ -98,6 +151,7 @@ if (-not $gitReady) {
         }
         Write-Host "下载 $relative"
         Save-GithubFile $mediaUri $destination
+        Assert-OcrFile $destination $expectedSize $expectedHash $hashKind
     }
 }
 $required = @("ppocr_worker.exe", "models\plate_rtdetr.onnx")
@@ -112,7 +166,6 @@ New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 Copy-Item -LiteralPath (Join-Path $projectRoot "ocr\OCR.yaml") -Destination (Join-Path $configDir "OCR.yaml") -Force
 $workerPath = Join-Path $ocrTarget "ppocr_worker.exe"
 $beforePatch = (Get-FileHash -LiteralPath $workerPath -Algorithm SHA256).Hash
-$patchInfoPath = Join-Path $ocrTarget "WORKER_PATCH.json"
 $upstreamHash = if (Test-Path $patchInfoPath) { (Get-Content -Raw $patchInfoPath | ConvertFrom-Json).upstream_sha256 } else { $beforePatch }
 $needle = "utility.cc"
 $replacement = "./x/y.cc.."
