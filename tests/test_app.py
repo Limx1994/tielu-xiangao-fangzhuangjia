@@ -215,7 +215,6 @@ def test_recording_time_rejects_out_of_range(pre, post):
 
 
 def test_serial_trigger_parsing():
-    assert recorder.parse_trigger({"mode": "hex", "trigger": "AA 55:01"}) == b"\xaa\x55\x01"
     assert recorder.parse_trigger({"mode": "text", "trigger": "OPEN"}) == b"OPEN"
     assert recorder.parse_acceleration_trigger(b"OPEN:-1.25:0:9.81", b"OPEN\r\n") == {
         "command": "OPEN", "acceleration": {"x": -1.25, "y": 0.0, "z": 9.81},
@@ -225,8 +224,6 @@ def test_serial_trigger_parsing():
         recorder.parse_acceleration_trigger(b"OPEN:1:2", b"OPEN\r\n")
     with pytest.raises(ValueError, match="有限数值"):
         recorder.parse_acceleration_trigger(b"OPEN:nan:2:3", b"OPEN\r\n")
-    with pytest.raises(ValueError):
-        recorder.parse_trigger({"mode": "hex", "trigger": "ABC"})
 
 
 def test_serial_probe_protocol_and_config():
@@ -243,6 +240,10 @@ def test_serial_probe_protocol_and_config():
     assert stream.written == recorder.SERIAL_BIND
     value = recorder.deep_merge(recorder.DEFAULT_CONFIG, {"serial_ports": [{"device_id": "trigger_1", "baudrate": 9600, "mode": "text", "trigger": "OPEN"}]})
     recorder.validate_config(value)
+    value["serial_ports"][0]["mode"] = "hex"
+    with pytest.raises(recorder.AppError, match="串口触发模式必须为 text"):
+        recorder.validate_config(value)
+    value["serial_ports"][0]["mode"] = "text"
     value["serial_ports"][0]["device_id"] = "bad id"
     with pytest.raises(recorder.AppError): recorder.validate_config(value)
 
@@ -418,8 +419,31 @@ def test_ocr_batches_expand_from_trigger(monkeypatch):
     assert all(fps == 2 and 0 < duration <= 10 for fps, _start, duration in calls)
 
 
-def test_ocr_worker_nested_result(tmp_path, monkeypatch):
-    inner = '{"rec_texts":["皖A·195K9"],"rec_scores":[0.9972],}'
+def test_jpeg_frames_thread_limits(monkeypatch):
+    from io import BytesIO
+    commands = []
+    class Process:
+        stderr = None
+        def __init__(self): self.stdout = BytesIO(b"\xff\xd8jpeg\xff\xd9")
+        def wait(self, timeout=None): return 0
+        def poll(self): return 0
+    def create_process(command, **_kwargs):
+        commands.append(command)
+        return Process()
+    monkeypatch.setattr(recorder.subprocess, "Popen", create_process)
+    assert list(recorder.jpeg_frames(recorder.Path("event.mp4"), 2, 5.0, 10.0)) == [(5.0, b"\xff\xd8jpeg\xff\xd9")]
+    command = commands[0]; input_pos = command.index("-i")
+    assert command[command.index("-filter_threads") + 1] == str(recorder.OCR_FRAME_THREADS)
+    assert command[:input_pos][-2:] == ["-ss", "5.000000"]
+    for options in (command[:input_pos], command[input_pos + 2:]):
+        assert options[options.index("-threads") + 1] == str(recorder.OCR_FRAME_THREADS)
+
+
+@pytest.mark.parametrize(("inner", "expected_texts", "expected_scores"), [
+    ('{"rec_texts":["皖A·195K9"],"rec_scores":[0.9972],}', ["皖A·195K9"], [0.9972]),
+    ('{"rec_texts":["广告]","粤B12345"],"rec_scores":[0.5,0.95],}', ["广告]", "粤B12345"], [0.5, 0.95]),
+])
+def test_ocr_worker_nested_result(tmp_path, monkeypatch, inner, expected_texts, expected_scores):
     line = "OK " + json.dumps({"results": [{"result": inner}]}, ensure_ascii=False) + "\n"
     class Input:
         def write(self, value): pass
@@ -441,7 +465,7 @@ def test_ocr_worker_nested_result(tmp_path, monkeypatch):
     assert client.frame_path.read_bytes() == b"jpeg"
     client.close()
     assert not client.frame_path.exists()
-    assert result == {"rec_texts": ["皖A·195K9"], "rec_scores": [0.9972]}
+    assert result == {"rec_texts": expected_texts, "rec_scores": expected_scores}
 
 
 def test_atomic_json(tmp_path):
@@ -684,6 +708,7 @@ def test_forward_accepts_udp_or_ip():
     assert recorder.normalize_udp_target("192.168.2.20") == "udp://192.168.2.20:5000"
     assert recorder.normalize_udp_target("192.168.2.20:5001") == "udp://192.168.2.20:5001"
     assert recorder.normalize_udp_target("udp://receiver.local:6000") == "udp://receiver.local:6000"
+    with pytest.raises(ValueError, match="端口无效"): recorder.normalize_udp_target("udp://192.0.2.20:0")
     with pytest.raises(ValueError): recorder.normalize_udp_target("http://192.168.2.20:5000")
     with pytest.raises(ValueError): recorder.normalize_udp_target("192.168.2.999:5000")
 
@@ -783,6 +808,11 @@ def test_rtsp_commands_use_supported_timeout():
     assert all("nobuffer" in item for _, item in previews)
     assert all(item[item.index("-vf") + 1] == f"fps={recorder.PREVIEW_FPS}" for _, item in previews)
     assert all(item[item.index("-threads") + 1] == str(recorder.PREVIEW_THREADS) for _, item in previews)
+    for _, item in previews:
+        input_pos = item.index("-i")
+        assert item[item.index("-filter_threads") + 1] == str(recorder.PREVIEW_THREADS)
+        for options in (item[:input_pos], item[input_pos + 2:]):
+            assert options[options.index("-threads") + 1] == str(recorder.PREVIEW_THREADS)
     assert all("scale=" not in item for _, command in previews for item in command)
 
 
@@ -892,12 +922,31 @@ def test_preview_close_stops_subscriber():
 
     preview = recorder.Preview({"id": "cam", "rtsp_url": "rtsp://192.0.2.1/main"})
     preview.thread = ExistingThread()
+    preview.viewers = 1
     preview.frame = b"jpeg"
     subscriber = preview.subscribe()
     assert next(subscriber).endswith(b"jpeg\r\n")
     preview.close()
     with pytest.raises(StopIteration):
         next(subscriber)
+    assert preview.viewers == 1
+
+
+def test_preview_reconnect_waits_for_new_frame(monkeypatch):
+    preview = recorder.Preview({"id": "cam", "rtsp_url": "rtsp://192.0.2.1/main"})
+    preview.frame = b"old"
+
+    class StartingThread:
+        def __init__(self, **_kwargs): pass
+        def is_alive(self): return True
+        def start(self):
+            assert preview.frame is None
+            preview.frame = b"new"
+
+    monkeypatch.setattr(recorder.threading, "Thread", StartingThread)
+    subscriber = preview.subscribe()
+    assert next(subscriber).endswith(b"new\r\n")
+    subscriber.close()
     assert preview.viewers == 0
 
 
@@ -1251,6 +1300,14 @@ def test_config_api_requires_csrf(client):
     assert response.status_code == 403
 
 
+def test_config_api_rejects_camera_without_id(client, monkeypatch):
+    monkeypatch.setattr(recorder.runtime.manifests, "iter_all", lambda: iter(()))
+    config = recorder.deep_merge(recorder.DEFAULT_CONFIG, {"cameras": [{}]})
+    response = client.put("/api/config", json={"config": config}, headers=client.csrf_headers)
+    assert response.status_code == 422
+    assert response.get_json()["error"]["code"] == "INVALID_CONFIG"
+
+
 def test_config_api_forwards_secret_clear(client, monkeypatch):
     seen = {}
     def apply(config, secrets, clear):
@@ -1406,10 +1463,11 @@ def test_disk_low_restarts_recorders(monkeypatch):
     assert item.closed and runtime.accepting_events and restarted == [True]
 
 
-def test_manual_retry_uses_current_config(tmp_path):
+@pytest.mark.parametrize("recording,ocr", [("complete", "complete"), ("complete", "disabled"), ("complete", "failed"), ("failed", "failed")])
+def test_manual_retry_uses_current_config(tmp_path, recording, ocr):
     path = tmp_path / "manifest.json"; path.write_text("{}")
     manifest = {"config": {"upload": {"text_url": "old"}}, "text_upload": {"status": "attention", "attempts": 8},
-                "video_upload": {"status": "complete", "attempts": 1}}
+                "video_upload": {"status": "complete", "attempts": 1}, "recording": {"status": recording}, "ocr": {"status": ocr}}
     class Store:
         def path(self, event_id, camera_id): return path
         def load(self, value): return manifest
@@ -1421,6 +1479,22 @@ def test_manual_retry_uses_current_config(tmp_path):
     assert manifest["text_upload"]["status"] == "pending" and manifest["text_upload"]["attempts"] == 0
 
 
+@pytest.mark.parametrize("recording,ocr", [("waiting", "pending"), ("pending", "pending"), ("complete", "pending"), ("complete", "waiting")])
+@pytest.mark.parametrize("active", [False, True])
+def test_retry_rejects_processing(client, tmp_path, monkeypatch, recording, ocr, active):
+    store = recorder.ManifestStore(tmp_path, recorder.atomic_json, recorder.logger, recorder.utc_now)
+    manifest = store.create("evt", {"id": "cam"}, 100.0, recorder.deep_merge(recorder.DEFAULT_CONFIG, {}))
+    manifest["recording"]["status"], manifest["ocr"]["status"] = recording, ocr
+    store.save(manifest); path = store.path("evt", "cam")
+    monkeypatch.setattr(recorder.runtime, "manifests", store)
+    monkeypatch.setattr(recorder.runtime, "queue_sets", {"upload": {str(path)} if active else set()})
+    monkeypatch.setattr(recorder.runtime, "upload_reruns", {})
+    monkeypatch.setattr(recorder.runtime, "_enqueue", lambda *_args: pytest.fail("处理中事件不能进入上传队列"))
+    response = client.post("/api/events/evt/cam/retry", headers=client.csrf_headers, json={})
+    assert response.status_code == 409 and response.get_json()["error"]["code"] == "EVENT_PROCESSING"
+    assert store.load(path) == manifest and recorder.runtime.upload_reruns == {}
+
+
 def test_active_upload_retry_requeued(tmp_path):
     path = tmp_path / "evt" / "cam" / "manifest.json"
     path.parent.mkdir(parents=True); path.write_text("{}", encoding="utf-8")
@@ -1428,6 +1502,7 @@ def test_active_upload_retry_requeued(tmp_path):
         "config": {"upload": {"text_url": "old"}},
         "text_upload": {"status": "attention", "attempts": 8},
         "video_upload": {"status": "complete", "attempts": 1},
+        "recording": {"status": "complete"}, "ocr": {"status": "complete"},
     }
 
     class Store:
@@ -1453,7 +1528,7 @@ def test_active_upload_retry_requeued(tmp_path):
 def test_full_upload_queue_restores_retry(tmp_path):
     path = tmp_path / "evt" / "cam" / "manifest.json"; path.parent.mkdir(parents=True); path.write_text("{}")
     manifest = {"config": {"upload": {"text_url": "old"}}, "text_upload": {"status": "attention", "attempts": 1},
-                "video_upload": {"status": "complete", "attempts": 1}}
+                "video_upload": {"status": "complete", "attempts": 1}, "recording": {"status": "complete"}, "ocr": {"status": "complete"}}
     class Store:
         def path(self, *_args): return path
         def load(self, _path): return manifest

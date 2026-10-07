@@ -1,3 +1,4 @@
+import http.cookiejar
 import json
 import subprocess
 import time
@@ -13,6 +14,7 @@ run_key = r"Software\Microsoft\Windows\CurrentVersion\Run"
 name = "XgfzjRecorder"
 config = json.loads((dist / "config.json").read_text(encoding="utf-8-sig")) if (dist / "config.json").exists() else {"http": {"port": 5000}}
 base_url = f"http://127.0.0.1:{int(config['http']['port'])}"
+opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
 
 
 def call(method, path, token=None, payload=None):
@@ -21,7 +23,7 @@ def call(method, path, token=None, payload=None):
     if token: headers["X-CSRF-Token"] = token
     if data: headers["Content-Type"] = "application/json"
     request = urllib.request.Request(base_url + path, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(request, timeout=5) as response:
+    with opener.open(request, timeout=5) as response:
         return json.load(response)
 
 

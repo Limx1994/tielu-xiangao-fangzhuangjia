@@ -1,4 +1,5 @@
 import argparse
+import http.cookiejar
 import io
 import json
 import time
@@ -7,13 +8,16 @@ import urllib.request
 from PIL import Image
 
 
+opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+
+
 def call(base, method, path, token=None, payload=None):
     data = json.dumps(payload).encode() if payload is not None else None
     headers = {"Origin": base}
     if token: headers["X-CSRF-Token"] = token
     if data: headers["Content-Type"] = "application/json"
     request = urllib.request.Request(base + path, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(request, timeout=10) as response:
+    with opener.open(request, timeout=10) as response:
         return json.load(response)
 
 
@@ -40,7 +44,7 @@ if not device: raise RuntimeError(f"没有发现可连接设备，失败数: {le
 camera_id = "cam_" + device["ip"].replace(".", "_")
 camera = call(args.base, "POST", "/api/cameras", token, {"id": camera_id, "name": f"ONVIF {device['ip']}", "scan_ip": device["ip"]})
 
-preview = urllib.request.urlopen(args.base + "/api/preview/" + camera_id, timeout=30)
+preview = opener.open(args.base + "/api/preview/" + camera_id, timeout=30)
 buffer = bytearray(); frame = None; deadline = time.time() + 30
 while time.time() < deadline:
     buffer.extend(preview.read(8192))

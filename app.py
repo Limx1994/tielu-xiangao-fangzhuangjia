@@ -71,6 +71,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "serial_ports": [{"device_id": "trigger_1", "baudrate": 9600, "mode": "text", "trigger": "XGFZJ:TRIGGER:trigger_1:1\r\n", "enabled": True}],
 }
 OCR_FPS = 2
+OCR_FRAME_THREADS = 2
 OCR_BATCH_SECONDS = 10.0
 OCR_MAX_CONSECUTIVE_FAILURES = 3
 SEGMENT_GAP_TOLERANCE_SECONDS = 2.0
@@ -189,7 +190,7 @@ def validate_config(config: dict[str, Any]) -> None:
             device_id = str(port.get("device_id", "")); serial_ids.append(device_id)
             if "enabled" in port and not isinstance(port["enabled"], bool): raise ValueError("串口 enabled 必须为布尔值")
             if not re.fullmatch(r"[A-Za-z0-9_-]{1,40}", device_id): raise ValueError("串口设备 ID 无效")
-            if port.get("mode") not in ("hex", "text"): raise ValueError("串口触发模式必须为 hex 或 text")
+            if port.get("mode") != "text": raise ValueError("串口触发模式必须为 text")
             if not 300 <= int(port.get("baudrate", 9600)) <= 4_000_000: raise ValueError("串口波特率无效")
             parse_trigger(port)
         if len(serial_ids) != len(set(serial_ids)): raise ValueError("串口设备 ID 重复")
@@ -199,11 +200,6 @@ def parse_trigger(item: dict[str, Any]) -> bytes:
     value = str(item.get("trigger", ""))
     if not value:
         raise ValueError("触发指令不能为空")
-    if item.get("mode") == "hex":
-        compact = re.sub(r"[\s:-]", "", value)
-        if len(compact) % 2 or not re.fullmatch(r"[0-9a-fA-F]+", compact):
-            raise ValueError("HEX 触发指令无效")
-        return bytes.fromhex(compact)
     return value.encode("utf-8")
 def serial_identity(device_id: str) -> bytes:
     return f"XGFZJ:DEVICE:{device_id}:1\r\n".encode("ascii")
@@ -404,6 +400,7 @@ class Preview:
         self.process: subprocess.Popen | None = None; self.thread: threading.Thread | None = None; self.mode = "未启动"
     def subscribe(self) -> Iterable[bytes]:
         with self.lock:
+            if self.viewers == 0: self.frame = None
             self.viewers += 1; self.last_viewer = time.time()
             if not self.thread or not self.thread.is_alive():
                 self.thread = threading.Thread(target=self._run, name=f"preview-{self.camera['id']}", daemon=True); self.thread.start()
@@ -411,8 +408,9 @@ class Preview:
             last = None
             while not self.closed.is_set():
                 with self.lock:
-                    self.lock.wait_for(lambda last=last: self.closed.is_set() or self.frame is not None and self.frame is not last, timeout=5)
+                    ready = self.lock.wait_for(lambda last=last: self.closed.is_set() or self.frame is not None and self.frame is not last, timeout=5)
                     if self.closed.is_set(): break
+                    if not ready: continue
                     frame = self.frame; self.last_viewer = time.time()
                 if frame:
                     last = frame; yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
@@ -421,7 +419,7 @@ class Preview:
                 self.viewers = max(0, self.viewers - 1); self.last_viewer = time.time()
     def _commands(self) -> Iterable[tuple[str, list[str]]]:
         url = camera_url(self.camera, "rtsp_url")
-        common = ["-hide_banner", "-loglevel", "error", "-rtsp_transport", "tcp", "-timeout", "15000000", "-fflags", "nobuffer"]
+        common = ["-hide_banner", "-loglevel", "error", "-filter_threads", str(PREVIEW_THREADS), "-rtsp_transport", "tcp", "-timeout", "15000000", "-fflags", "nobuffer", "-threads", str(PREVIEW_THREADS)]
         out = ["-i", url, "-an", "-vf", f"fps={PREVIEW_FPS}", "-q:v", "6", "-threads", str(PREVIEW_THREADS), "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
         for mode, accel in (("D3D11VA", ["-hwaccel", "d3d11va"]), ("DXVA2", ["-hwaccel", "dxva2"]), ("软件解码", [])):
             yield mode, [str(FFMPEG)] + common + accel + out
@@ -460,6 +458,9 @@ class Preview:
             except Exception as exc:
                 logger.warning("预览 %s %s 失败: %s", self.camera["id"], mode, exc)
             finally:
+                with self.lock:
+                    self.frame = None
+                    self.lock.notify_all()
                 stop_process(self.process)
         self.mode = "预览失败"
         if self.viewers > 0 and not self.closed.wait(3):
@@ -506,8 +507,10 @@ class OCRClient:
                 if not line.startswith("OK "): raise AppError(line[4:].strip() if line.startswith("ERR ") else "OCR worker 响应无效", "OCR_FAILED", 502)
                 payload = json.loads(line[3:]); merged: dict[str, list[Any]] = {"rec_texts": [], "rec_scores": []}
                 for result in payload.get("results", []):
-                    nested = result.get("result"); texts = re.search(r'"rec_texts"\s*:\s*(\[[^\]]*\])', nested) if isinstance(nested, str) else None; scores = re.search(r'"rec_scores"\s*:\s*(\[[^\]]*\])', nested) if isinstance(nested, str) else None
-                    result = {"rec_texts": json.loads(texts.group(1)), "rec_scores": json.loads(scores.group(1))} if texts and scores else result
+                    nested = result.get("result"); texts = re.search(r'"rec_texts"\s*:\s*(?=\[)', nested) if isinstance(nested, str) else None; scores = re.search(r'"rec_scores"\s*:\s*(?=\[)', nested) if isinstance(nested, str) else None
+                    if texts and scores:
+                        decoder = json.JSONDecoder()
+                        result = {"rec_texts": decoder.raw_decode(nested[texts.end():])[0], "rec_scores": decoder.raw_decode(nested[scores.end():])[0]}
                     merged["rec_texts"].extend(result.get("rec_texts", [])); merged["rec_scores"].extend(result.get("rec_scores", []))
                 return merged
             except (OSError, ValueError, json.JSONDecodeError, queue.Empty) as exc:
@@ -526,11 +529,11 @@ def read_line_timeout(process: subprocess.Popen, timeout: float, reader_pool: Th
         if process.poll() is None: process.terminate()
         raise AppError("OCR worker 响应超时", "OCR_TIMEOUT", 504) from None
 def jpeg_frames(video: Path, fps: int, start: float = 0.0, duration: float | None = None) -> Iterable[tuple[float, bytes]]:
-    command = [str(FFMPEG), "-hide_banner", "-loglevel", "error"]
+    command = [str(FFMPEG), "-hide_banner", "-loglevel", "error", "-filter_threads", str(OCR_FRAME_THREADS), "-threads", str(OCR_FRAME_THREADS)]
     if start > 0: command.extend(("-ss", f"{start:.6f}"))
     command.extend(("-i", str(video)))
     if duration is not None: command.extend(("-t", f"{duration:.6f}"))
-    command.extend(("-vf", f"fps={fps}", "-q:v", "4", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"))
+    command.extend(("-vf", f"fps={fps}", "-q:v", "4", "-threads", str(OCR_FRAME_THREADS), "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"))
     process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **process_args()); errors: deque[bytes] = deque(maxlen=20)
     drain = threading.Thread(target=drain_pipe, args=(process.stderr, errors, b""), daemon=True); drain.start()
     buffer, index = bytearray(), 0
@@ -627,7 +630,8 @@ class Runtime:
     def apply_config(self, config: dict[str, Any], secrets_update: dict[str, str] | None = None, clear_secrets: Iterable[str] | None = None) -> dict[str, Any]:
         with self.config_lock: return self._apply_config(config, secrets_update, clear_secrets)
     def _apply_config(self, config: dict[str, Any], secrets_update: dict[str, str] | None, clear_secrets: Iterable[str] | None) -> dict[str, Any]:
-        old = self.config; old_cams = {item["id"]: item for item in old.get("cameras", [])}; new_cams = {item["id"]: item for item in config.get("cameras", [])}
+        validate_config_structure(config)
+        old = self.config; old_cams = {item["id"]: item for item in old.get("cameras", [])}; new_cams = {str(item.get("id", "")): item for item in config.get("cameras", [])}
         for camera_id, before in old_cams.items():
             after = new_cams.get(camera_id)
             value = camera_url(after, "rtsp_url") if after else ""
@@ -723,40 +727,26 @@ class Runtime:
     def _listen_serial(self, stream: Any, definition: dict[str, Any], trigger: bytes, generation: int) -> None:
         device_id = definition["device_id"]
         buffer, limit, last_probe, probe_deadline = bytearray(), 4096, time.monotonic(), 0.0
-        identity_frame = serial_identity(device_id)
-        identity = identity_frame.rstrip(b"\r\n")
-        heartbeat_frame = serial_heartbeat_ack(device_id)
-        heartbeat_ack = heartbeat_frame.rstrip(b"\r\n")
+        identity = serial_identity(device_id).rstrip(b"\r\n")
+        heartbeat_ack = serial_heartbeat_ack(device_id).rstrip(b"\r\n")
         while not self.stop.is_set() and generation == self.serial_generation:
             chunk = stream.read(max(1, int(getattr(stream, "in_waiting", 0))))
             if chunk: buffer.extend(chunk)
-            if definition.get("mode") == "hex":
-                if identity_frame in buffer: buffer[:] = buffer.replace(identity_frame, b"", 1); probe_deadline = 0.0
-                if heartbeat_frame in buffer:
-                    buffer[:] = buffer.replace(heartbeat_frame, b"", 1); probe_deadline = 0.0
-                    self._serial_state(device_id, generation, last_heartbeat=utc_now())
-                while (position := buffer.find(trigger)) >= 0:
-                    del buffer[:position + len(trigger)]
-                    trigger_data = {"command": trigger.hex().upper()}
-                    self._serial_state(device_id, generation, last_trigger=utc_now())
-                    try: self.trigger(f"serial:{device_id}", trigger_data)
-                    except AppError as exc: self.add_error(f"串口触发未接受: {exc.message}")
-            else:
-                while b"\n" in buffer:
-                    raw, _, remainder = buffer.partition(b"\n"); buffer[:] = remainder
-                    line = raw.rstrip(b"\r")
-                    if line in (identity, heartbeat_ack):
-                        probe_deadline = 0.0
-                        if line == heartbeat_ack: self._serial_state(device_id, generation, last_heartbeat=utc_now())
-                        continue
-                    try: trigger_data = parse_acceleration_trigger(line, trigger)
-                    except ValueError as exc:
-                        self.add_error(f"串口设备 {device_id} 触发数据无效: {exc}")
-                        continue
-                    if trigger_data is None: continue
-                    self._serial_state(device_id, generation, last_trigger=utc_now(), acceleration=trigger_data["acceleration"])
-                    try: self.trigger(f"serial:{device_id}", trigger_data)
-                    except AppError as exc: self.add_error(f"串口触发未接受: {exc.message}")
+            while b"\n" in buffer:
+                raw, _, remainder = buffer.partition(b"\n"); buffer[:] = remainder
+                line = raw.rstrip(b"\r")
+                if line in (identity, heartbeat_ack):
+                    probe_deadline = 0.0
+                    if line == heartbeat_ack: self._serial_state(device_id, generation, last_heartbeat=utc_now())
+                    continue
+                try: trigger_data = parse_acceleration_trigger(line, trigger)
+                except ValueError as exc:
+                    self.add_error(f"串口设备 {device_id} 触发数据无效: {exc}")
+                    continue
+                if trigger_data is None: continue
+                self._serial_state(device_id, generation, last_trigger=utc_now(), acceleration=trigger_data["acceleration"])
+                try: self.trigger(f"serial:{device_id}", trigger_data)
+                except AppError as exc: self.add_error(f"串口触发未接受: {exc.message}")
             if len(buffer) > limit:
                 buffer.clear()
                 self.add_error(f"串口设备 {device_id} 接收帧超过 {limit} 字节，已丢弃")
@@ -1017,8 +1007,11 @@ class Runtime:
         if not path.exists(): raise AppError("事件不存在", "NOT_FOUND", 404)
         key = str(path); condition = getattr(self, "delay_condition", threading.RLock()); reruns = getattr(self, "upload_reruns", {})
         with condition:
+            manifest = self.manifests.load(path)
+            if manifest["recording"]["status"] in ("waiting", "pending") or manifest["ocr"]["status"] in ("waiting", "pending"):
+                raise AppError("事件仍在录像或 OCR 处理中，请稍后重试上传", "EVENT_PROCESSING", 409)
             if isinstance(reruns, set): reruns = {item: set() for item in reruns}
-            self.upload_reruns = reruns; manifest = self.manifests.load(path); stages = {stage for stage in ("text_upload", "video_upload") if manifest[stage]["status"] != "complete"}
+            self.upload_reruns = reruns; stages = {stage for stage in ("text_upload", "video_upload") if manifest[stage]["status"] != "complete"}
             if key in self.queue_sets["upload"]:
                 self.upload_reruns.setdefault(key, set()).update(stages); return
             self._reset_upload(path, stages)

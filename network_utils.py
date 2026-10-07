@@ -54,7 +54,7 @@ def normalize_udp_target(value: Any) -> str:
     normalized = target if re.match(r"^udp://", target, re.I) else f"udp://{target}"
     parsed = urlparse(normalized)
     try:
-        port = parsed.port or 5000
+        port = parsed.port if parsed.port is not None else 5000
     except ValueError as exc:
         raise ValueError("实时转发端口无效") from exc
     if parsed.scheme.lower() != "udp" or not parsed.hostname or parsed.username or parsed.password:
