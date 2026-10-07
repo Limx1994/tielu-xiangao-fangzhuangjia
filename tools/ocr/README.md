@@ -18,6 +18,8 @@
 
 正常使用时无需手工启动 OCR 进程；运行 `app.py` 或打包后的 `XgfzjRecorder.exe` 即可。
 
+上述命令须在 `tools\ocr` 目录执行。应用使用绝对模型路径，worker 的 CPU 线程数取自 `ocr.cpu_threads`（默认 2）；FFmpeg 抽帧的解码、滤镜和 JPEG 编码另行固定限制为 2 个线程，不随该配置改变。
+
 事件视频拼接完成后，应用固定以 2 FPS 抽帧。扫描以触发点为中心，每轮读取前后各最多 10 秒画面，并按距触发点由近到远送入 worker；worker 复用单个响应读取线程和单个临时帧文件。首次识别到满足格式和置信度要求的车牌后停止；连续 3 帧处理失败时终止当前事件 OCR，避免故障期间重复启动 worker 和刷写日志。该帧率不是 worker 参数，也不能通过 `config.json` 调整；旧版 `ocr.fps` 字段会由应用自动移除。
 
 ## 目录内容
@@ -88,6 +90,8 @@ Set-Location tools\ocr
 runtime\logs\ocr.log
 runtime\logs\ocr.log.1
 ```
+
+应用支持解析 worker 嵌套字符串中的 `rec_texts` 和 `rec_scores` 数组，包括识别文本内含 `]` 的情况；通信或解析失败会明确上报。HTTP 就绪检查仅检查必要 OCR 文件是否存在，不会启动 worker 或验证识别结果。
 
 常见问题：
 

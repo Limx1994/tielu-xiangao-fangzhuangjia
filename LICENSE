@@ -1,0 +1,130 @@
+Copyright (c) 2026 The Copyright Holder（本项目版权所有者）
+
+This work is licensed under the PolyForm Noncommercial License, Version 1.0.0,
+available at https://polyformproject.org/licenses/noncommercial/1.0.0/
+
+---------------------------------------------------------------------------
+
+# PolyForm Noncommercial License 1.0.0
+
+<https://polyformproject.org/licenses/noncommercial/1.0.0>
+
+## Acceptance
+
+In order to get any license under these terms, you must agree
+to them as both strict obligations and conditions to all
+your licenses.
+
+## Copyright License
+
+The licensor grants you a copyright license for the
+software to do everything that might infringe the licensor's copyright
+in copying it, preparing derivative works of it, and distributing
+and running those derivative works, including in source and object
+(form), subject to the conditions in the other terms.
+
+## Patent License
+
+The licensor grants you a license to any patents it can license that
+would infringe the software as permitted by the copyright license,
+subject to the patent license conditions in the other terms.
+
+## Noncommercial Purposes
+
+Any noncommercial purpose is a permitted purpose. The licensor
+waives the terms of this license for any purpose that qualifies
+as noncommercial, as further defined in the [PolyForm
+Noncommercial Purpose Definition](https://polyformproject.org/noncommercial-1.0.0).
+
+## Personal Uses
+
+Personal use for research, experiment, and testing for
+the benefit of public knowledge, personal study, private entertainment,
+hobby projects, amateur pursuits, or religious observance, without
+any anticipated commercial application, is use for a permitted
+purpose.
+
+## No Other Rights
+
+These terms do not allow you to sublicense or transfer any of
+your licenses to anyone else, or prevent the licensor from granting
+licenses to anyone else.
+
+## Patent Defense
+
+If you make any written claim that the software infringes or
+contributes to infringement of any patent, your patent license for
+the software granted under these terms ends immediately. If your
+company makes such a claim, your patent license ends immediately
+for work on behalf of your company.
+
+## Notices
+
+You must ensure that anyone who gets a copy of any part of
+the software from you also gets a copy of these terms.
+
+If you modify the software, you must include in any modified copies
+of the software prominent notices stating that you have modified
+the software.
+
+## No Other Warranty
+
+The software is provided "as-is". The licensor makes no warranties
+of any kind, express or implied, including without limitation any
+warranties of merchantability, fitness for a particular purpose,
+or noninfringement. To the maximum extent permitted by applicable
+law, the licensor shall not be liable for any damages whatsoever
+arising from or related to the use of the software, however caused
+and under any theory of liability, whether in contract, strict
+liability, or tort (including negligence), even if the licensor has
+been advised of the possibility of such damages.
+
+---------------------------------------------------------------------------
+
+# 附加条款（Additional Terms）—— 非商业限制与黑名单禁用
+
+本节为 PolyForm Noncommercial License 1.0.0 的附加条款，与上述英文原文
+具有同等法律效力。若本节与英文原文存在冲突，以更严格的限制为准。
+
+## 一、非商业限制（Noncommercial Restriction）
+
+1. 本项目（包括其全部源代码、文档及衍生作品）仅可用于非商业目的
+   （Noncommercial Purposes），禁止用于任何商业目的或具有商业性质的
+   用途，包括但不限于：销售、商业分发、商业部署、提供付费服务、
+   内部商业运营支持等。
+2. 任何对本项目的使用、复制、修改或分发行为，均不得直接或间接地
+   与任何商业活动、商业产品或商业服务相关联。
+
+## 二、黑名单禁用条款（Blacklist Restriction）
+
+1. 以下公司（「黑名单公司」）及其关联公司、关联成员，无论出于何种
+   目的，均不得以任何形式使用、复制、修改、分发本项目或其任何部分
+   及衍生作品：
+
+   黑名单公司列表：
+   - 连华永兴科技发展有限公司
+   - 北京鼎兴达信息科技股份有限公司
+
+2. 前款所述「关联公司及成员」包括但不限于：
+   - 黑名单公司的母公司、子公司、分公司、参股或控股公司；
+   - 与黑名单公司受同一实际控制人、同一法定代表人或同一管理团队
+     控制的其他公司或组织；
+   - 黑名单公司的在职、离职员工，及其雇佣、委托或授权的任何人员
+     （以下简称「关联成员」）；
+   - 以关联成员名义、通过第三方代持、借用他人名义或以其他任何方式
+     实际为本项目使用主体的情形，视为黑名单公司的关联使用。
+
+3. 关联关系的最终解释权归本项目版权所有者（The Copyright Holder）
+   所有。版权所有者有权自行认定任何公司、组织或个人是否属于黑名单
+   公司的关联公司或关联成员，该认定对使用方具有约束力。
+
+## 三、违约后果
+
+黑名单公司及其关联公司、关联成员使用本项目的任何行为，均不构成
+对本项目的许可，且构成对本附加条款的违反。版权所有者有权依法追究
+其相应法律责任。
+
+---------------------------------------------------------------------------
+
+PolyForm Noncommercial License 1.0.0 全文见：
+https://polyformproject.org/licenses/noncommercial/1.0.0
